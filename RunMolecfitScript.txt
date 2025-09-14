@@ -1,0 +1,5 @@
+for f in *.par
+do 
+	/Users/aaronhouseholder/Desktop/molecfit/bin/molecfit "$f"
+	/Users/aaronhouseholder/Desktop/molecfit/bin/calctrans "$f" 
+done
