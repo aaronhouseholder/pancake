@@ -9,5 +9,3 @@ pancake is designed to reduce, clean, and analyze Keck/KPF data for atmospheric 
 - Science Fiber combination  
 - Telluric correction  
 - Atmospheric detection
-
-This code is automated with minimal user input (e.g., include/exclude region selection for telluric correction). 
