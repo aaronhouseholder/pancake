@@ -9,9 +9,10 @@ import glob
 from astropy import time, coordinates as coord, units as u
 import os
 from pathlib import Path
+from lmfit.models import GaussianModel
 
 
-class ExoplanetSystem:
+class Planet:
     """Container for exoplanet system parameters"""
     
     def __init__(self, name, t0, period, kp, k_star, vsys, stellar_radius, 
@@ -61,7 +62,7 @@ class Atmosphere:
         
         Parameters
         ----------
-        system : ExoplanetSystem
+        system : Planet
             System parameters
         file_pattern : str
             Glob pattern for data files
@@ -93,16 +94,33 @@ class Atmosphere:
         
         template_lower = clean_name.lower()
         
+        # Species mapping for your specific templates
         species_map = {
+            # Sodium variants
             'na_lor_cut': 'Na I', 'na_allard': 'Na I', 
             'na_allard_new': 'Na I', 'na_burrows': 'Na I', 'na': 'Na I',
-            'ca+': 'Ca II', 'ca': 'Ca II', 
+            'ca+': 'Ca II', 'ca': 'Ca I', 
+            
+            # Iron variants
             'fe+': 'Fe+', 'fe': 'Fe I',
+            
+            # Magnesium variants
             'mg+': 'Mg+', 'mg': 'Mg I',
+            
+            # Potassium
             'k': 'K I',
+            
+            # Titanium variants
             'ti': 'Ti I',
+            
+            # Vanadium
             'v': 'V I',
+            
+            # Silicon
             'si': 'Si I',
+            'cr_agss09': 'Cr I', 'cr': 'Cr I',
+   
+            # Molecules
             'tio_48_exomol_mckemmish': 'TiO',
             'vo': 'VO',
             'cah': 'CaH',
@@ -246,7 +264,7 @@ class Atmosphere:
         return cleaned_flux
     
     def clean_spectra(self, waves, fluxes, transit_indices, do_pca=True, 
-                     pca_components=3, plots=False):
+                     pca_components=5, plots=False):
         """
         Complete spectral cleaning pipeline
         
@@ -325,7 +343,7 @@ class Atmosphere:
         print(f"Cleaning complete. Final grid: {len(wave_grid_final)} wavelength points")
         
         return wave_grid_final, final_cleaned
-    
+
     def cross_correlate(self, waves, fluxes, model_wave, model_flux, transit_indices):
         """
         Cross-correlate spectra with atmospheric model
@@ -339,7 +357,7 @@ class Atmosphere:
         model_wave : ndarray
             Model wavelength array
         model_flux : ndarray
-            Model flux array
+            Model flux array (radius in Rj) 
         transit_indices : list
             Transit boundary indices
             
@@ -357,23 +375,36 @@ class Atmosphere:
         model_flux_clip = model_flux[model_mask]
         
         poly_coeffs = np.polyfit(model_wave_clip, model_flux_clip, 3)
-        continuum = np.poly1d(poly_coeffs)(model_wave_clip)
-        model_flux_norm = model_flux_clip / continuum
+        continuum_rj = np.poly1d(poly_coeffs)(model_wave_clip)
+        
+        jupiter_to_solar = 0.10049  # Rj/Rs conversion
+        rp_atmosphere_rs = model_flux_clip * jupiter_to_solar  # atmospheric radius in Rs
+        rp_continuum_rs = continuum_rj * jupiter_to_solar      # continuum radius in Rs
+        stellar_radius_rs = self.system.stellar_radius         # stellar radius in Rs
+        depth_difference_ppm = ((rp_atmosphere_rs**2 - rp_continuum_rs**2) / stellar_radius_rs**2) * 1e6
+        
+        template_std = np.std(depth_difference_ppm)
+        if template_std > 0:
+            normalized_template = depth_difference_ppm / template_std
+        else:
+            normalized_template = depth_difference_ppm
         
         rv_grid = np.arange(-300, 300, 0.5)
-        model_flux_grid = []
+        model_depth_grid = []
         
         for rv in rv_grid:
             model_wave_shift = model_wave_clip / (1 - rv / (2.998e5))
-            interp_func = inter.CubicSpline(model_wave_shift, model_flux_norm)
+            interp_func = inter.CubicSpline(model_wave_shift, normalized_template)
             interp_model = interp_func(waves)
-            model_flux_grid.append(interp_model / np.sum(interp_model))
+            model_depth_grid.append(interp_model)
+        
+        flux_residuals_ppm = (1.0 - fluxes) * 1e6
         
         cc_grid = []
-        for i, flux in enumerate(fluxes):
+        for i, flux_residual in enumerate(flux_residuals_ppm):
             cc_row = []
-            for j, model_shifted in enumerate(model_flux_grid):
-                cc = np.sum(flux * model_shifted)
+            for j, template in enumerate(model_depth_grid):
+                cc = np.dot(flux_residual, template) * template_std / len(template)
                 cc_row.append(cc)
             cc_grid.append(cc_row)
         
@@ -385,14 +416,14 @@ class Atmosphere:
         
         cc_grid_norm = []
         for cc_row in cc_grid:
-            cc_corr = cc_row / mean_cc
-            smoothed = gaussian_filter1d(cc_corr, 140)
-            residual = cc_corr - smoothed
+            cc_systematic = cc_row - mean_cc
+            smoothed = gaussian_filter1d(cc_systematic, 140)
+            residual = cc_systematic - smoothed
             cc_grid_norm.append(residual)
         
         print("Cross-correlation complete")
-        return rv_grid, cc_grid_norm
-    
+        return rv_grid, cc_grid_norm    
+
     def shift_ccf_to_planet_frame(self, rv_grid, cc_grid, planet_rvs):
         """
         Shift CCF to planet rest frame
@@ -435,8 +466,7 @@ class Atmosphere:
         """
         print(f"Making Kp-Vsys plot for {template_name}...")
         
-        # Define search grids exactly like original
-        kp_grid = np.arange(self.system.kp + 70, self.system.kp - 70, -0.5)
+        kp_grid = np.arange(self.system.kp + 80, self.system.kp - 80, -0.5)
         vsys_grid = np.arange(-70, 70, 0.25)
         shift_grid = np.arange(-100, 100, 1.0)
         
@@ -452,11 +482,9 @@ class Atmosphere:
                     shifted_cc = interp_func(shift_grid)
                     shifted_ccs.append(shifted_cc)
                 
-                # Combine and calculate SNR
                 combined_cc = np.nanmean(shifted_ccs, axis=0)
                 signal = combined_cc[np.where(shift_grid == 0)][0]
                 
-                # Noise calculation exactly like original
                 inds_low = np.where(shift_grid < -54)[0]
                 inds_up = np.where(shift_grid > 49)[0]
                 nopeak = np.concatenate((combined_cc[inds_low], combined_cc[inds_up]))
@@ -466,8 +494,7 @@ class Atmosphere:
                 snr = (signal - noise_mean) / noise_std
                 snr_grid[i, j] = snr
         
-        snr_grid *= -1
-        
+        species_label = self.get_species_label(template_name)
         max_idx = np.unravel_index(np.argmax(snr_grid), snr_grid.shape)
         best_kp = kp_grid[max_idx[0]]
         best_vsys = vsys_grid[max_idx[1]]
@@ -481,6 +508,277 @@ class Atmosphere:
         
         return snr_grid, vsys_grid, kp_grid
     
+    def analyze_blueshift_phase_by_phase(self, rv_grid, cc_grid, phases, transit_indices, 
+                                       kp=None, vsys=0, template_name='unknown'):
+        """
+        Analyze the blueshift of signal by fitting Gaussians to the beginning 
+        and end of transit separately.
+        
+        Parameters
+        ----------
+        rv_grid : ndarray
+            Velocity grid for CCFs
+        cc_grid : ndarray
+            2D CCF grid (n_obs x n_velocities)
+        phases : ndarray
+            Orbital phases for each observation
+        transit_indices : list
+            [start_index, end_index] of transit
+        kp : float
+            Planet semi-amplitude in km/s
+        vsys : float
+            System velocity in km/s
+        template_name : str
+            Name of template for saving files
+        """
+        if kp is None:
+            kp = self.system.kp
+            
+        # Debug: print phase information
+        print(f"Phase range in data: {np.min(phases):.4f} to {np.max(phases):.4f}")
+        print(f"Number of observations: {len(phases)}")
+        print(f"Transit indices: {transit_indices}")
+        
+        cc_planet_frame = []
+        
+        for i in range(len(cc_grid)):
+            # Calculate planet RV at this phase
+            planet_rv = kp * np.sin(2 * np.pi * phases[i]) + vsys
+            
+            # Shift the CCF to planet frame
+            f_interp = inter.interp1d(rv_grid - planet_rv, cc_grid[i], 
+                               bounds_error=False, fill_value=np.nan)
+            cc_shifted = f_interp(rv_grid)
+            cc_planet_frame.append(cc_shifted)
+        
+        cc_planet_frame = np.array(cc_planet_frame)
+        
+        # Define phase ranges for beginning and end of transit
+        phase_begin_mask = (phases >= -0.04) & (phases <= -0.02)
+        phase_end_mask = (phases >= 0.02) & (phases <= 0.04)
+        
+        print(f"Observations in beginning of transit: {np.sum(phase_begin_mask)}")
+        print(f"Observations in end of transit: {np.sum(phase_end_mask)}")
+        
+        if np.sum(phase_begin_mask) > 0:
+            ccf_begin = np.nanmean(cc_planet_frame[phase_begin_mask], axis=0)
+        else:
+            print("ERROR: No data for beginning of transit")
+            return None
+            
+        if np.sum(phase_end_mask) > 0:
+            ccf_end = np.nanmean(cc_planet_frame[phase_end_mask], axis=0)
+        else:
+            print("ERROR: No data for end of transit")
+            return None
+        
+        in_transit_mask = np.zeros(len(phases), dtype=bool)
+        in_transit_mask[transit_indices[0]:transit_indices[1]] = True
+        ccf_full = np.nanmean(cc_planet_frame[in_transit_mask], axis=0)
+        
+        def fit_gaussian_to_ccf(rv, ccf, initial_center=0):
+            """Fit a Gaussian to a 1D CCF and return parameters"""
+            if np.all(np.isnan(ccf)):
+                return None
+            
+            ccf_scaled = ccf  # no longer need negative scaling b/c fixed elsewhere
+            
+            # Find approximate peak location
+            peak_idx = np.nanargmax(ccf_scaled)
+            peak_rv = rv[peak_idx]
+            
+            # Create Gaussian model
+            model = GaussianModel()
+            
+            # Set initial parameters
+            params = model.make_params(
+                amplitude=ccf_scaled[peak_idx],
+                center=peak_rv,
+                sigma=10  # Initial guess for width
+            )
+            
+            # Add reasonable bounds for line center
+            params['center'].min = -20
+            params['center'].max = 20
+            params['sigma'].min = 2
+            params['sigma'].max = 30
+            params['amplitude'].min = 0
+            
+            # Fit only around the peak (±30 km/s for better fit)
+            fit_mask = np.abs(rv - peak_rv) < 30
+            
+            try:
+                result = model.fit(ccf_scaled[fit_mask], x=rv[fit_mask], params=params)
+                
+                # Calculate uncertainty on center: sigma / SNR
+                noise_mask = (np.abs(rv) > 50) & (~np.isnan(ccf_scaled))
+                if np.sum(noise_mask) > 10:
+                    noise_std = np.std(ccf_scaled[noise_mask])
+                    snr = result.params['amplitude'].value / noise_std
+                    center_err = result.params['sigma'].value / snr if snr > 1 else 2.0
+                else:
+                    center_err = result.params['center'].stderr or 2.0
+                
+                return {
+                    'center': result.params['center'].value,
+                    'center_err': center_err,
+                    'amplitude': result.params['amplitude'].value,
+                    'sigma': result.params['sigma'].value,
+                    'fwhm': 2.355 * result.params['sigma'].value,
+                    'result': result,
+                    'ccf_scaled': ccf_scaled  # Return scaled CCF for plotting
+                }
+            except Exception as e:
+                print(f"Fitting failed: {e}")
+                return None
+        
+        fit_begin = fit_gaussian_to_ccf(rv_grid, ccf_begin)
+        fit_end = fit_gaussian_to_ccf(rv_grid, ccf_end)
+        fit_full = fit_gaussian_to_ccf(rv_grid, ccf_full)
+        
+        # Create the plot
+        fig, ax = plt.subplots(figsize=(8.0, 3.5))
+        
+        # Get phase ranges for legend labels
+        phase_begin_range = phases[phase_begin_mask]
+        phase_end_range = phases[phase_end_mask]
+        
+        if len(phase_begin_range) > 0:
+            phi_begin_str = f'φ = {np.min(phase_begin_range):.3f} to {np.max(phase_begin_range):.3f}'
+        else:
+            phi_begin_str = 'φ = early'
+            
+        if len(phase_end_range) > 0:
+            phi_end_str = f'φ = {np.min(phase_end_range):.3f} to {np.max(phase_end_range):.3f}'
+        else:
+            phi_end_str = 'φ = late'
+        
+        # Plot 1D CCFs without Gaussian fits
+        if fit_begin is not None:
+            ax.plot(rv_grid, ccf_begin, color='magenta', linewidth=2, 
+                     label=f'{phi_begin_str}')
+            ax.axvline(fit_begin['center'], color='magenta', linestyle='--', 
+                       linewidth=1, alpha=0.7)
+        else:
+            ax.plot(rv_grid, ccf_begin, color='magenta', linewidth=2, 
+                     label=f'{phi_begin_str}\n(no fit)')
+        
+        if fit_end is not None:
+            ax.plot(rv_grid, ccf_end, color='darkblue', linewidth=2, 
+                     label=f'{phi_end_str}')
+            ax.axvline(fit_end['center'], color='darkblue', linestyle='--', 
+                       linewidth=1, alpha=0.7)
+        else:
+            ax.plot(rv_grid, ccf_end, color='darkblue', linewidth=2, 
+                     label=f'{phi_end_str}\n(no fit)')
+        
+        ax.axvline(0, color='gray', linestyle=':', linewidth=1, alpha=0.5)
+        ax.set_xlim(-75, 75)
+        ax.set_xlabel('Radial Velocity in Planet Rest Frame (km s$^{-1}$)', fontsize=18)
+        ax.set_ylabel('Amplitude (ppm)', fontsize=18)
+        
+        # Keep the original legend in upper right with styling
+        phase_legend = ax.legend(loc='upper right', fontsize=14, frameon=True, fancybox=True, 
+                               shadow=True, framealpha=0.9)
+        ax.add_artist(phase_legend)  # This preserves the phase range legend
+        
+        ax.grid(True, alpha=0.3)
+        
+        # Add velocity legend in top left, aligned with right-side legend
+        if fit_begin is not None and fit_end is not None:
+            # Create custom legend entries with dashed lines and colored text
+            from matplotlib.lines import Line2D
+            legend_elements = [
+                Line2D([0], [0], color='magenta', linestyle='--', linewidth=2, 
+                      label=f'{fit_begin["center"]:.1f} km/s'),
+                Line2D([0], [0], color='darkblue', linestyle='--', linewidth=2, 
+                      label=f'{fit_end["center"]:.1f} km/s')
+            ]
+            velocity_legend = ax.legend(handles=legend_elements, loc='upper left', 
+                                      fontsize=14, frameon=True, fancybox=True, 
+                                      shadow=True, framealpha=0.9)
+            ax.add_artist(velocity_legend)
+        elif fit_begin is not None:
+            from matplotlib.lines import Line2D
+            legend_elements = [
+                Line2D([0], [0], color='magenta', linestyle='--', linewidth=2, 
+                      label=f'{fit_begin["center"]:.1f} km/s')
+            ]
+            velocity_legend = ax.legend(handles=legend_elements, loc='upper left', 
+                                      fontsize=14, frameon=True, fancybox=True, 
+                                      shadow=True, framealpha=0.9)
+            ax.add_artist(velocity_legend)
+        elif fit_end is not None:
+            from matplotlib.lines import Line2D
+            legend_elements = [
+                Line2D([0], [0], color='darkblue', linestyle='--', linewidth=2, 
+                      label=f'{fit_end["center"]:.1f} km/s')
+            ]
+            velocity_legend = ax.legend(handles=legend_elements, loc='upper left', 
+                                      fontsize=14, frameon=True, fancybox=True, 
+                                      shadow=True, framealpha=0.9)
+            ax.add_artist(velocity_legend)
+        
+        plt.xticks(fontsize=14)
+        plt.yticks(fontsize=14)
+        plt.tight_layout()
+        
+        species_label = self.get_species_label(template_name)
+        print(f"\n{species_label} Blueshift Analysis Results:")
+        print("="*50)
+        
+        if fit_begin is not None:
+            print(f"Near ingress:")
+            print(f"  RV center: {fit_begin['center']:.2f} ± {fit_begin['center_err']:.2f} km/s")
+            print(f"  Amplitude: {fit_begin['amplitude']:.1f} ppm")
+            print(f"  FWHM: {fit_begin['fwhm']:.1f} km/s")
+        else:
+            print("Near ingress: No fit possible")
+        
+        if fit_end is not None:
+            print(f"\nNear egress:")
+            print(f"  RV center: {fit_end['center']:.2f} ± {fit_end['center_err']:.2f} km/s")
+            print(f"  Amplitude: {fit_end['amplitude']:.1f} ppm")
+            print(f"  FWHM: {fit_end['fwhm']:.1f} km/s")
+        else:
+            print("\nNear egress: No fit possible")
+        
+        if fit_begin is not None and fit_end is not None:
+            rv_shift = fit_end['center'] - fit_begin['center']
+            print(f"\nVelocity shift (egress - ingress): {rv_shift:.2f} km/s")
+            
+            # Calculate significance of the shift
+            combined_error = np.sqrt(fit_begin['center_err']**2 + fit_end['center_err']**2)
+            significance = np.abs(rv_shift) / combined_error
+            print(f"Significance: {significance:.1f}σ")
+            
+            if significance > 2:
+                print(f"✓ Significant shift detected (> 2σ)")
+            else:
+                print(f"✗ No significant shift (< 2σ)")
+        else:
+            print("\nCannot calculate velocity shift without both fits")
+            rv_shift = np.nan
+            significance = np.nan
+        
+        # Save figures
+        plt.savefig(f'{template_name}_blueshift_analysis.pdf', dpi=300, bbox_inches='tight')
+        plt.savefig(f'{template_name}_blueshift_analysis.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        return {
+            'fit_begin': fit_begin,
+            'fit_end': fit_end,
+            'fit_full': fit_full,
+            'ccf_begin': ccf_begin,
+            'ccf_end': ccf_end,
+            'ccf_full': ccf_full,
+            'rv_shift': rv_shift if 'rv_shift' in locals() else np.nan,
+            'significance': significance if 'significance' in locals() else np.nan,
+            'n_early': np.sum(phase_begin_mask),
+            'n_late': np.sum(phase_end_mask)
+        }
+
     def load_data(self):
         """
         Load and process observational data
@@ -587,37 +885,49 @@ class Atmosphere:
                       extent=[vsys_grid[0], vsys_grid[-1], kp_grid[-1], kp_grid[0]],
                       aspect='auto', interpolation='nearest')
         
-        ax.set_xlabel('$v_{sys}$ (km s$^{-1}$)', fontsize=14)
-        ax.set_ylabel('$K_p$ (km s$^{-1}$)', fontsize=14)
+        ax.set_xlabel('$v_{sys}$ (km s$^{-1}$)', fontsize=18)
+        ax.set_ylabel('$K_p$ (km s$^{-1}$)', fontsize=18)
         
         cb = fig.colorbar(im)
-        cb.set_label('SNR', rotation=90, fontsize=14)
-        cb.ax.tick_params(labelsize=14)
+        cb.set_label('SNR', rotation=90, fontsize=18)
+        cb.ax.tick_params(labelsize=18)
         cb.ax.get_yaxis().labelpad = 4
         
         ax.plot([vsys_grid[0], vsys_grid[-1]], [self.system.kp, self.system.kp], 'k--')
         ax.plot([0, 0], [kp_grid[0], kp_grid[-1]], 'k--')
         
         species_label = self.get_species_label(template_name)
-        ax.text(0.05, 0.95, species_label, 
+        ax.text(0.05, 0.05, species_label, 
                 transform=ax.transAxes,
-                fontsize=24,
+                fontsize=21.5,
                 fontweight='bold',
                 color='white',
-                verticalalignment='top',
+                verticalalignment='bottom',
                 horizontalalignment='left',
                 bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7))
         
-        plt.xticks(fontsize=14)
-        plt.yticks(fontsize=14)
+        # Add maximum SNR value in bottom right corner
+        max_snr = np.max(snr_grid)
+        if max_snr > 5:
+            ax.text(0.975, 0.05, f'SNR = {max_snr:.1f}', 
+                transform=ax.transAxes,
+                fontsize=21.5,
+                fontweight='bold',
+                color='white',
+                verticalalignment='bottom',
+                horizontalalignment='right',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7))
+        
+        plt.xticks(fontsize=18)
+        plt.yticks(fontsize=18)
         plt.tight_layout()
         
         plt.savefig(f'{template_name}_Kp-vsys.png', bbox_inches='tight')
         plt.savefig(f'{template_name}_Kp-vsys.pdf', dpi=300, bbox_inches='tight')
         print(f"Saved: {template_name}_Kp-vsys.pdf")
         print(f"Saved: {template_name}_Kp-vsys.png")
-        plt.show()
-    
+        plt.close()
+        
     def _plot_ccf_map(self, rv_grid, cc_grid, template_name, output_path):
         """Generate 2D CCF map"""
         fig, ax = plt.subplots(figsize=(8.0, 3.5))
@@ -645,7 +955,7 @@ class Atmosphere:
         ax.set_aspect(1100)
         
         cb = fig.colorbar(im)
-        cb.set_label('CCF Amplitude (ppm)', rotation=270, fontsize=18)
+        cb.set_label('Amplitude (ppm)', rotation=270, fontsize=18)
         cb.ax.tick_params(labelsize=14)
         cb.ax.get_yaxis().labelpad = 15
         
@@ -655,23 +965,21 @@ class Atmosphere:
         
         plt.savefig(f'{template_name}_SRF.png')
         print(f"Saved: {template_name}_SRF.png")
-        plt.show()
+        plt.close()
     
     def _plot_planet_rest_frame(self, rv_grid, cc_grid, template_name, output_path):
         """Generate planet rest frame plot"""
         # Shift to planet rest frame
         new_vel, cc_planet = self.shift_ccf_to_planet_frame(rv_grid, cc_grid, self.data_table['planet_rvs'])
         
-        # Sort by phase
         phases_sorted = np.sort(self.data_table['phases'])
         cc_planet_sorted = cc_planet[np.argsort(self.data_table['phases']), :]
-        cc_planet_sorted *= -1
         
         extent = [new_vel[0], new_vel[-1], phases_sorted[0], phases_sorted[-1]]
         
         species_label = self.get_species_label(template_name)
         
-        color_schemes = [('gray', 'Gray'), ('gray_r', 'Gray Inverted')]
+        color_schemes = [('gray', 'Gray')]
         
         for cmap_name, cmap_label in color_schemes:
             fig, ax = plt.subplots(figsize=(8, 3.5))
@@ -706,7 +1014,7 @@ class Atmosphere:
                     bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7))
             
             cb = fig.colorbar(im)
-            cb.set_label('CCF Amplitude (ppm)', fontsize=18)
+            cb.set_label('Amplitude (ppm)', fontsize=18)
             cb.ax.tick_params(labelsize=18)
             cb.ax.get_yaxis().labelpad = 15
             
@@ -737,14 +1045,12 @@ class Atmosphere:
             ax.set_xlabel('Radial Velocity in Planet Rest Frame (km s$^{-1}$)', fontsize=18)
             ax.set_ylabel('Orbital Phase', fontsize=18)
             
-            # Transit boundary lines
             t1, t2 = self.transit_indices
             ax.plot([-200, 200], [self.data_table['phases'][t1], self.data_table['phases'][t1]], 
                     color='darkblue', linestyle='--', linewidth=3)
             ax.plot([-200, 200], [self.data_table['phases'][t2], self.data_table['phases'][t2]], 
                     color='magenta', linestyle='--', linewidth=3)
             
-            # Species label
             ax.text(0.05, 0.95, species_label, 
                     transform=ax.transAxes,
                     fontsize=24,
@@ -755,7 +1061,7 @@ class Atmosphere:
                     bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7))
             
             cb = fig.colorbar(im)
-            cb.set_label('CCF Amplitude (ppm)', fontsize=18)
+            cb.set_label('Amplitude (ppm)', fontsize=18)
             cb.ax.tick_params(labelsize=18)
             cb.ax.get_yaxis().labelpad = 15
             
@@ -770,7 +1076,7 @@ class Atmosphere:
             print(f"Saved: {filename}")
             plt.close()
     
-    def process_template(self, template_path, output_dir="."):
+    def process_template(self, template_path, output_dir=".", include_blueshift_analysis=True):
         """
         Process a single atmospheric template
         
@@ -780,6 +1086,8 @@ class Atmosphere:
             Path to template file
         output_dir : str
             Directory for output files
+        include_blueshift_analysis : bool
+            Whether to perform blueshift analysis
             
         Returns
         -------
@@ -804,8 +1112,9 @@ class Atmosphere:
         model_wave = template_data['Wavelength']
         model_flux = template_data['Radius']
         
-        print(f"Template wavelength range: {model_wave.min():.1f} - {model_wave.max():.1f} Ã…")
+        print(f"Template wavelength range: {model_wave.min():.1f} - {model_wave.max():.1f} Å")
         
+        # Ensure data is loaded and cleaned
         if self.data_table is None:
             self.load_data()
         
@@ -816,15 +1125,17 @@ class Atmosphere:
                 np.array(self.data_table['flux']),
                 self.transit_indices,
                 do_pca=True,
-                pca_components=3
+                pca_components=6
             )
         
+        # Cross-correlate (no scaling applied)
         rv_grid, cc_grid = self.cross_correlate(
             self.clean_wave_grid, self.clean_flux_grid,
             model_wave, model_flux, self.transit_indices
         )
         cc_grid = np.array(cc_grid)
         
+        # Find best parameters
         snr_grid, vsys_grid, kp_grid = self.find_best_kp_vsys(
             rv_grid, cc_grid, self.data_table['phases'], template_name
         )
@@ -836,6 +1147,18 @@ class Atmosphere:
         self._plot_ccf_map(rv_grid, cc_grid, template_name, output_path)
         self._plot_planet_rest_frame(rv_grid, cc_grid, template_name, output_path)
         
+        # Add blueshift analysis
+        blueshift_results = None
+        if include_blueshift_analysis:
+            try:
+                blueshift_results = self.analyze_blueshift_phase_by_phase(
+                    rv_grid, cc_grid, self.data_table['phases'], 
+                    self.transit_indices, self.system.kp, self.system.vsys, template_name
+                )
+                print(f"Blueshift analysis completed for {template_name}")
+            except Exception as e:
+                print(f"Blueshift analysis failed for {template_name}: {e}")
+        
         results = {
             'template_name': template_name,
             'species_label': self.get_species_label(template_name),
@@ -845,12 +1168,14 @@ class Atmosphere:
             'vsys_grid': vsys_grid,
             'kp_grid': kp_grid,
             'max_snr': np.max(snr_grid),
-            'template_wave_range': (model_wave.min(), model_wave.max())
+            'template_wave_range': (model_wave.min(), model_wave.max()),
+            'blueshift_results': blueshift_results
         }
         
         return results
     
-    def process_all_templates(self, template_dir="templates", output_dir="results"):
+    def process_all_templates(self, template_dir="templates", output_dir="results", 
+                            include_blueshift_analysis=True):
         """
         Process all templates in a directory
         
@@ -860,6 +1185,8 @@ class Atmosphere:
             Directory containing template files
         output_dir : str
             Directory for output files
+        include_blueshift_analysis : bool
+            Whether to perform blueshift analysis
             
         Returns
         -------
@@ -880,11 +1207,27 @@ class Atmosphere:
         
         all_results = []
         for template_file in template_files:
-            result = self.process_template(template_file, output_dir)
+            result = self.process_template(template_file, output_dir, include_blueshift_analysis)
             if result is not None:
                 all_results.append(result)
         
         print(f"\nProcessed {len(all_results)} templates successfully")
+        
+        # Summary report
+        print(f"\nSUMMARY:")
+        print(f"{'Species':>12} {'Max SNR':>10} {'RV Shift':>12} {'Significance':>12}")
+        print("-" * 50)
+        for result in sorted(all_results, key=lambda x: x['max_snr'], reverse=True):
+            if result['blueshift_results'] is not None:
+                rv_shift = result['blueshift_results']['rv_shift']
+                significance = result['blueshift_results']['significance']
+                rv_shift_str = f"{rv_shift:.2f} km/s" if not np.isnan(rv_shift) else "N/A"
+                sig_str = f"{significance:.1f}σ" if not np.isnan(significance) else "N/A"
+            else:
+                rv_shift_str = "N/A"
+                sig_str = "N/A"
+            print(f"{result['species_label']:>12} {result['max_snr']:>10.2f} {rv_shift_str:>12} {sig_str:>12}")
+        
         return all_results
 
 
@@ -895,7 +1238,7 @@ if __name__ == "__main__":
                                unit=(u.hourangle, u.deg), frame='icrs')
     keck = coord.EarthLocation.of_site('Keck')
     
-    wasp76b_system = ExoplanetSystem(
+    wasp76b_system = Planet(
         name="WASP-76b",
         t0=2457273.4191,  # BJD_TDB from Kokori et al.
         period=1.8098806,  # days from Kokori et al.
@@ -908,14 +1251,17 @@ if __name__ == "__main__":
         transit_phase_half_width=0.04
     )
     
+    run_cc = Atmosphere(wasp76b_system, "latestDRP/*L1.fits")
     
-    w76 = Atmosphere(wasp76b_system, "latestDRP/*L1.fits")
+    single_result = run_cc.process_template("templates/Cr_agss09.dat", 
+                                            include_blueshift_analysis=True)
     
-    fe = w76.process_template("templates/Fe_custom.dat")
+    if single_result:
+        print(f"Successfully processed {single_result['species_label']}")
+        print(f"Max SNR: {single_result['max_snr']:.2f}")
+        if single_result['blueshift_results']:
+            rv_shift = single_result['blueshift_results']['rv_shift']
+            significance = single_result['blueshift_results']['significance']
     
-    if fe:
-        print(f"Successfully processed {fe['species_label']}")
-        print(f"Max SNR: {fe['max_snr']:.2f}")
-    
-    print("\nProcessing all templates...")
-    all_results = w76.process_all_templates("templates", "results")
+    all_results = run_cc.process_all_templates("templates", "results", 
+                                                include_blueshift_analysis=True)
