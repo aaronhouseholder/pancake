@@ -54,111 +54,129 @@ class Planet:
         self.observatory = observatory
         self.transit_phase_half_width = transit_phase_half_width
 
+class DataLoader:
+    """Handles data loading and basic preprocessing"""
+    
+    @staticmethod
+    def load_observations(file_pattern, system):
+        """Load and process observational data files"""
+        print(f"Loading data from pattern: {file_pattern}")
+        file_list = glob.glob(file_pattern)
+        
+        if len(file_list) == 0:
+            raise FileNotFoundError(f"No files found matching pattern: {file_pattern}")
+        
+        print(f"Found {len(file_list)} files")
+        
+        combined_fluxes = []
+        rest_waves = []
+        phases = []
+        planet_rvs = []
+        barycentric_corrections = []
+        bjds = []
+        stellar_rvs = []
+        
+        for file_path in file_list:
+            data = DataLoader._process_single_file(file_path, system)
+            combined_fluxes.append(data['flux'])
+            rest_waves.append(data['wave'])
+            phases.append(data['phase'])
+            planet_rvs.append(data['planet_rv'])
+            barycentric_corrections.append(data['vbar'])
+            bjds.append(data['bjd'])
+            stellar_rvs.append(data['stellar_rv'])
+        
+        data_table = Table({
+            'flux': combined_fluxes,
+            'waves': rest_waves,
+            'phases': phases,
+            'planet_rvs': planet_rvs,
+            'barycentric_corrections': barycentric_corrections,
+            'bjds': bjds,
+            'stellar_rvs': stellar_rvs
+        })
+        
+        data_table.sort('bjds')
+        data_table.reverse()
+        
+        # Calculate transit indices
+        transit_indices = DataLoader._calculate_transit_indices(
+            data_table['phases'], system.transit_phase_half_width
+        )
+        
+        print(f"Data loaded successfully:")
+        print(f"  Number of observations: {len(data_table)}")
+        print(f"  Phase range: {np.min(data_table['phases']):.4f} to {np.max(data_table['phases']):.4f}")
+        print(f"  Transit indices: {transit_indices}")
+        
+        return data_table, transit_indices
+    
+    @staticmethod
+    def _process_single_file(file_path, system):
+        """Process a single FITS file"""
+        with fits.open(file_path, memmap=False) as hdul:
+            # Read science fibers
+            wave_1 = hdul['WAVE_INTERP_SCI1'].data
+            flux_1 = hdul['FLUX_INTERP_SCI1'].data
+            wave_2 = hdul['WAVE_INTERP_SCI2'].data
+            flux_2 = hdul['FLUX_INTERP_SCI2'].data
+            wave_3 = hdul['WAVE_INTERP_SCI3'].data
+            flux_3 = hdul['FLUX_INTERP_SCI3'].data
+            
+            # Combine fibers
+            interp_func1 = inter.CubicSpline(wave_1, flux_1)
+            interp_func2 = inter.CubicSpline(wave_2, flux_2)
+            combined_flux = np.nanmean([flux_3, interp_func1(wave_3), 
+                                      interp_func2(wave_3)], axis=0)
+            
+            # Time and velocity corrections
+            obs_time = hdul[0].header['DATE-MID']
+            t_astropy = time.Time(obs_time, format='isot', scale='utc', 
+                                location=system.observatory)
+            ltt_bary = t_astropy.light_travel_time(system.coordinates)
+            bjd = (t_astropy.tdb + ltt_bary).jd
+            
+            vbar_corr = system.coordinates.radial_velocity_correction(obstime=t_astropy)
+            vbar = vbar_corr.to(u.km/u.s).value
+            
+            phase = OrbitalCalculations.calculate_orbital_phase(bjd, system.t0, system.period)
+            stellar_rv = OrbitalCalculations.calculate_planet_rv(system.k_star, phase)
+            
+            # Apply velocity corrections to wavelengths
+            rest_wave = wave_3 / (1 + (-vbar + system.vsys - stellar_rv) / (2.99792e5))
+            
+            return {
+                'flux': combined_flux,
+                'wave': rest_wave,
+                'phase': phase,
+                'planet_rv': OrbitalCalculations.calculate_planet_rv(system.kp, phase),
+                'vbar': vbar,
+                'bjd': bjd,
+                'stellar_rv': stellar_rv
+            }
+    
+    @staticmethod
+    def _calculate_transit_indices(phases, transit_half_width):
+        """Calculate transit start and end indices"""
+        if phases[0] > transit_half_width:
+            transit_start = np.where(phases < transit_half_width)[0][0]
+        else:
+            transit_start = 0
+            
+        if phases[-1] < -transit_half_width:
+            transit_end = np.where(phases < -transit_half_width)[0][0]
+        else:
+            transit_end = len(phases)
+        
+        return [transit_start, transit_end]
 
-class Atmosphere:
-    def __init__(self, system, file_pattern="latestDRP/*L1.fits"):
-        """
-        Initialize the analyzer
-        
-        Parameters
-        ----------
-        system : Planet
-            System parameters
-        file_pattern : str
-            Glob pattern for data files
-        """
-        self.system = system
-        self.file_pattern = file_pattern
-        self.data_table = None
-        self.clean_wave_grid = None
-        self.clean_flux_grid = None
-        self.transit_indices = None
+
+class OrbitalCalculations:
+    """Handles orbital mechanics calculations"""
     
-    def get_species_label(self, template_name):
-        """
-        Convert template name to proper species label
-        
-        Parameters
-        ----------
-        template_name : str
-            Template filename or identifier
-            
-        Returns
-        -------
-        label : str
-            Formatted species label
-        """
-        # Remove common suffixes and prefixes
-        clean_name = template_name.replace('_custom', '')
-        clean_name = clean_name.replace('.dat', '')
-        
-        template_lower = clean_name.lower()
-        
-        # Species mapping for your specific templates
-        species_map = {
-            # Sodium variants
-            'na_lor_cut': 'Na I', 'na_allard': 'Na I', 
-            'na_allard_new': 'Na I', 'na_burrows': 'Na I', 'na': 'Na I',
-            'ca+': 'Ca II', 'ca': 'Ca I', 
-            
-            # Iron variants
-            'fe+': 'Fe+', 'fe': 'Fe I',
-            
-            # Magnesium variants
-            'mg+': 'Mg+', 'mg': 'Mg I',
-            
-            # Potassium
-            'k': 'K I',
-            
-            # Titanium variants
-            'ti': 'Ti I',
-            
-            # Vanadium
-            'v': 'V I',
-            
-            # Silicon
-            'si': 'Si I',
-            'cr_agss09': 'Cr I', 'cr': 'Cr I',
-   
-            # Molecules
-            'tio_48_exomol_mckemmish': 'TiO',
-            'vo': 'VO',
-            'cah': 'CaH',
-            'feh_main_iso': 'FeH'
-        }
-        
-        if template_lower in species_map:
-            return species_map[template_lower]
-        
-        for key, label in species_map.items():
-            if key in template_lower:
-                return label
-        
-        return clean_name.replace('_', ' ').title()
-    
-    def calculate_orbital_phase(self, t, t0=None, period=None):
-        """
-        Calculate orbital phase from observation time
-        
-        Parameters
-        ----------
-        t : float or array
-            Observation time in BJD
-        t0 : float, optional
-            Transit ephemeris (uses system default if None)
-        period : float, optional
-            Orbital period (uses system default if None)
-            
-        Returns
-        -------
-        phases : float or array
-            Orbital phases
-        """
-        if t0 is None:
-            t0 = self.system.t0
-        if period is None:
-            period = self.system.period
-            
+    @staticmethod
+    def calculate_orbital_phase(t, t0, period):
+        """Calculate orbital phase from observation time"""
         if np.isscalar(t):
             phase = (t - t0) / period
             if phase > 1 or phase < -1:
@@ -181,115 +199,19 @@ class Atmosphere:
                 phases.append(phase)
             return np.array(phases)
     
-    def calculate_planet_rv(self, kp, phase):
-        """
-        Calculate planet radial velocity at given phase
-        
-        Parameters
-        ----------
-        kp : float
-            Planet semi-amplitude in km/s
-        phase : float or array
-            Orbital phase
-            
-        Returns
-        -------
-        rv : float or array
-            Planet radial velocity in km/s
-        """
+    @staticmethod
+    def calculate_planet_rv(kp, phase):
+        """Calculate planet radial velocity at given phase"""
         return kp * np.sin(2*np.pi * phase)
+
+
+class SpectralCleaner:
+    """Handles additional spectral cleaning operations"""
     
-    def remove_vertical_outliers(self, flux_array, clip_sigma=3):
-        """
-        Remove vertical outliers using sigma clipping
-        
-        Parameters
-        ----------
-        flux_array : ndarray
-            2D flux array (n_obs x n_wavelengths)
-        clip_sigma : float
-            Sigma threshold for clipping
-            
-        Returns
-        -------
-        clipped_flux : ndarray
-            Flux array with outliers replaced
-        """
-        clipped_flux = flux_array.copy()
-        
-        for i in range(flux_array.shape[1]):
-            column_flux = flux_array[:, i]
-            median_flux = np.nanmedian(column_flux)
-            std_flux = np.nanstd(column_flux)
-            outlier_mask = np.abs(column_flux - median_flux) > clip_sigma * std_flux
-            
-            if np.any(outlier_mask):
-                clipped_flux[outlier_mask, i] = np.nan
-        
-        # Replace NaNs with column means
-        for i in range(clipped_flux.shape[1]):
-            nan_mask = np.isnan(clipped_flux[:, i])
-            if np.any(nan_mask):
-                clipped_flux[nan_mask, i] = np.nanmean(clipped_flux[:, i])
-        
-        return clipped_flux
-    
-    def apply_pca_cleaning(self, flux_array, n_components=5):
-        """
-        Apply PCA cleaning to remove systematic effects
-        
-        Parameters
-        ----------
-        flux_array : ndarray
-            2D flux array
-        n_components : int
-            Number of PCA components to remove
-            
-        Returns
-        -------
-        cleaned_flux : ndarray
-            PCA-cleaned flux array
-        """
-        # Singular value decomposition
-        u, s, vt = np.linalg.svd(flux_array, full_matrices=False)
-        v = vt.T
-        
-        # Remove first n components
-        s_new = s.copy()
-        s_new[:n_components] = 0.0
-        
-        # Calculate cleaned flux
-        cleaned_flux = np.dot(u, np.dot(np.diag(s_new), v.T)) + 1.0
-        
-        return cleaned_flux
-    
-    def clean_spectra(self, waves, fluxes, transit_indices, do_pca=True, 
+    @staticmethod
+    def clean_spectra(waves, fluxes, transit_indices, do_pca=True, 
                      pca_components=5, plots=False):
-        """
-        Complete spectral cleaning pipeline
-        
-        Parameters
-        ----------
-        waves : ndarray
-            2D wavelength array
-        fluxes : ndarray
-            2D flux array
-        transit_indices : list
-            [start, end] indices for transit
-        do_pca : bool
-            Whether to apply PCA cleaning
-        pca_components : int
-            Number of PCA components to remove
-        plots : bool
-            Whether to generate diagnostic plots
-            
-        Returns
-        -------
-        wave_grid : ndarray
-            Common wavelength grid
-        cleaned_flux : ndarray
-            Cleaned flux array
-        """
+        """Complete spectral cleaning pipeline"""
         print("Starting spectral cleaning pipeline...")
         
         # Step 1: Remove low flux regions (order gaps)
@@ -302,7 +224,7 @@ class Atmosphere:
         norm_fluxes = fluxes_clipped / np.nanmean(fluxes_clipped, axis=1, keepdims=True)
         
         # Step 3: Sigma clipping
-        sigma_clipped = self.remove_vertical_outliers(norm_fluxes, 3)
+        sigma_clipped = SpectralCleaner._remove_vertical_outliers(norm_fluxes, 3)
         
         # Step 4: Remove broadband variations
         blaze_removed = np.zeros_like(norm_fluxes)
@@ -327,7 +249,7 @@ class Atmosphere:
         
         # Step 6: PCA (optional)
         if do_pca:
-            pca_cleaned = self.apply_pca_cleaning(interp_fluxes, pca_components)
+            pca_cleaned = SpectralCleaner._apply_pca_cleaning(interp_fluxes, pca_components)
         else:
             pca_cleaned = interp_fluxes
         
@@ -338,36 +260,56 @@ class Atmosphere:
         cleaned_flux = pca_cleaned[:, mask]
         
         # Step 8: Final sigma clipping
-        final_cleaned = self.remove_vertical_outliers(cleaned_flux, 3)
+        final_cleaned = SpectralCleaner._remove_vertical_outliers(cleaned_flux, 3)
         
         print(f"Cleaning complete. Final grid: {len(wave_grid_final)} wavelength points")
         
         return wave_grid_final, final_cleaned
-
-    def cross_correlate(self, waves, fluxes, model_wave, model_flux, transit_indices):
-        """
-        Cross-correlate spectra with atmospheric model
+    
+    @staticmethod
+    def _remove_vertical_outliers(flux_array, clip_sigma=3):
+        """Remove vertical outliers using sigma clipping"""
+        clipped_flux = flux_array.copy()
         
-        Parameters
-        ----------
-        waves : ndarray
-            Wavelength grid
-        fluxes : ndarray
-            2D flux array
-        model_wave : ndarray
-            Model wavelength array
-        model_flux : ndarray
-            Model flux array (radius in Rj) 
-        transit_indices : list
-            Transit boundary indices
+        for i in range(flux_array.shape[1]):
+            column_flux = flux_array[:, i]
+            median_flux = np.nanmedian(column_flux)
+            std_flux = np.nanstd(column_flux)
+            outlier_mask = np.abs(column_flux - median_flux) > clip_sigma * std_flux
             
-        Returns
-        -------
-        rv_grid : ndarray
-            Radial velocity grid
-        cc_grid : list
-            Cross-correlation results for each spectrum
-        """
+            if np.any(outlier_mask):
+                clipped_flux[outlier_mask, i] = np.nan
+        
+        # Replace NaNs with column means
+        for i in range(clipped_flux.shape[1]):
+            nan_mask = np.isnan(clipped_flux[:, i])
+            if np.any(nan_mask):
+                clipped_flux[nan_mask, i] = np.nanmean(clipped_flux[:, i])
+        
+        return clipped_flux
+    
+    @staticmethod
+    def _apply_pca_cleaning(flux_array, n_components=5):
+        """Apply PCA cleaning to remove systematic effects"""
+        u, s, vt = np.linalg.svd(flux_array, full_matrices=False)
+        v = vt.T
+        
+        # Remove first n components
+        s_new = s.copy()
+        s_new[:n_components] = 0.0
+        
+        # Calculate cleaned flux
+        cleaned_flux = np.dot(u, np.dot(np.diag(s_new), v.T)) + 1.0
+        
+        return cleaned_flux
+
+
+class CrossCorrelation:
+    """Handles cross-correlation calculations"""
+    
+    @staticmethod
+    def cross_correlate(waves, fluxes, model_wave, model_flux, transit_indices, system):
+        """Cross-correlate spectra with atmospheric model"""
         clip_start = waves[0] - 10
         clip_end = waves[-1] + 10
         model_mask = (model_wave > clip_start) & (model_wave < clip_end)
@@ -378,9 +320,9 @@ class Atmosphere:
         continuum_rj = np.poly1d(poly_coeffs)(model_wave_clip)
         
         jupiter_to_solar = 0.10049  # Rj/Rs conversion
-        rp_atmosphere_rs = model_flux_clip * jupiter_to_solar  # atmospheric radius in Rs
-        rp_continuum_rs = continuum_rj * jupiter_to_solar      # continuum radius in Rs
-        stellar_radius_rs = self.system.stellar_radius         # stellar radius in Rs
+        rp_atmosphere_rs = model_flux_clip * jupiter_to_solar
+        rp_continuum_rs = continuum_rj * jupiter_to_solar
+        stellar_radius_rs = system.stellar_radius
         depth_difference_ppm = ((rp_atmosphere_rs**2 - rp_continuum_rs**2) / stellar_radius_rs**2) * 1e6
         
         template_std = np.std(depth_difference_ppm)
@@ -422,12 +364,11 @@ class Atmosphere:
             cc_grid_norm.append(residual)
         
         print("Cross-correlation complete")
-        return rv_grid, cc_grid_norm    
-
-    def shift_ccf_to_planet_frame(self, rv_grid, cc_grid, planet_rvs):
-        """
-        Shift CCF to planet rest frame
-        """
+        return rv_grid, cc_grid_norm
+    
+    @staticmethod
+    def shift_ccf_to_planet_frame(rv_grid, cc_grid, planet_rvs):
+        """Shift CCF to planet rest frame"""
         new_vel_grid = rv_grid.copy()
         cc_grid_planet_frame = np.zeros_like(cc_grid)
 
@@ -439,34 +380,16 @@ class Atmosphere:
             cc_grid_planet_frame[i] = f(new_vel_grid)
 
         return new_vel_grid, cc_grid_planet_frame
+
+class DetectionAnalysis:
+    """Handles Kp-Vsys analysis and blueshift detection"""
     
-    def find_best_kp_vsys(self, rv_grid, cc_grid, phases, template_name='unknown'):
-        """
-        Find best Kp and Vsys values using SNR optimization
-        
-        Parameters
-        ----------
-        rv_grid : ndarray
-            Radial velocity grid
-        cc_grid : ndarray
-            Cross-correlation grid
-        phases : ndarray
-            Orbital phases
-        template_name : str
-            Template identifier for output files
-            
-        Returns
-        -------
-        snr_grid : ndarray
-            SNR grid
-        vsys_grid : ndarray
-            System velocity grid
-        kp_grid : ndarray
-            Planet semi-amplitude grid
-        """
+    @staticmethod
+    def find_best_kp_vsys(rv_grid, cc_grid, phases, system, template_name='unknown'):
+        """Find best Kp and Vsys values using SNR optimization"""
         print(f"Making Kp-Vsys plot for {template_name}...")
         
-        kp_grid = np.arange(self.system.kp + 80, self.system.kp - 80, -0.5)
+        kp_grid = np.arange(system.kp + 80, system.kp - 80, -0.5)
         vsys_grid = np.arange(-70, 70, 0.25)
         shift_grid = np.arange(-100, 100, 1.0)
         
@@ -477,7 +400,7 @@ class Atmosphere:
                 # Shift CCFs to planet rest frame
                 shifted_ccs = []
                 for k, phase in enumerate(phases):
-                    planet_rv = self.calculate_planet_rv(kp, phase) + vsys
+                    planet_rv = OrbitalCalculations.calculate_planet_rv(kp, phase) + vsys
                     interp_func = inter.interp1d(rv_grid - planet_rv, cc_grid[k])
                     shifted_cc = interp_func(shift_grid)
                     shifted_ccs.append(shifted_cc)
@@ -494,7 +417,7 @@ class Atmosphere:
                 snr = (signal - noise_mean) / noise_std
                 snr_grid[i, j] = snr
         
-        species_label = self.get_species_label(template_name)
+        species_label = TemplateUtils.get_species_label(template_name)
         max_idx = np.unravel_index(np.argmax(snr_grid), snr_grid.shape)
         best_kp = kp_grid[max_idx[0]]
         best_vsys = vsys_grid[max_idx[1]]
@@ -504,37 +427,14 @@ class Atmosphere:
         print(f"Best Vsys: {best_vsys:.2f} km/s")
         print(f"Maximum SNR: {max_snr:.2f}")
         
-        self._plot_kp_vsys_map(snr_grid, vsys_grid, kp_grid, template_name)
+        PlottingUtils.plot_kp_vsys_map(snr_grid, vsys_grid, kp_grid, template_name, system)
         
         return snr_grid, vsys_grid, kp_grid
     
-    def analyze_blueshift_phase_by_phase(self, rv_grid, cc_grid, phases, transit_indices, 
-                                       kp=None, vsys=0, template_name='unknown'):
-        """
-        Analyze the blueshift of signal by fitting Gaussians to the beginning 
-        and end of transit separately.
-        
-        Parameters
-        ----------
-        rv_grid : ndarray
-            Velocity grid for CCFs
-        cc_grid : ndarray
-            2D CCF grid (n_obs x n_velocities)
-        phases : ndarray
-            Orbital phases for each observation
-        transit_indices : list
-            [start_index, end_index] of transit
-        kp : float
-            Planet semi-amplitude in km/s
-        vsys : float
-            System velocity in km/s
-        template_name : str
-            Name of template for saving files
-        """
-        if kp is None:
-            kp = self.system.kp
-            
-        # Debug: print phase information
+    @staticmethod
+    def analyze_blueshift_phase_by_phase(rv_grid, cc_grid, phases, transit_indices, 
+                                       kp, vsys, template_name='unknown'):
+        """Analyze the blueshift of signal by fitting Gaussians"""
         print(f"Phase range in data: {np.min(phases):.4f} to {np.max(phases):.4f}")
         print(f"Number of observations: {len(phases)}")
         print(f"Transit indices: {transit_indices}")
@@ -542,10 +442,7 @@ class Atmosphere:
         cc_planet_frame = []
         
         for i in range(len(cc_grid)):
-            # Calculate planet RV at this phase
             planet_rv = kp * np.sin(2 * np.pi * phases[i]) + vsys
-            
-            # Shift the CCF to planet frame
             f_interp = inter.interp1d(rv_grid - planet_rv, cc_grid[i], 
                                bounds_error=False, fill_value=np.nan)
             cc_shifted = f_interp(rv_grid)
@@ -576,73 +473,341 @@ class Atmosphere:
         in_transit_mask[transit_indices[0]:transit_indices[1]] = True
         ccf_full = np.nanmean(cc_planet_frame[in_transit_mask], axis=0)
         
-        def fit_gaussian_to_ccf(rv, ccf, initial_center=0):
-            """Fit a Gaussian to a 1D CCF and return parameters"""
-            if np.all(np.isnan(ccf)):
-                return None
-            
-            ccf_scaled = ccf  # no longer need negative scaling b/c fixed elsewhere
-            
-            # Find approximate peak location
-            peak_idx = np.nanargmax(ccf_scaled)
-            peak_rv = rv[peak_idx]
-            
-            # Create Gaussian model
-            model = GaussianModel()
-            
-            # Set initial parameters
-            params = model.make_params(
-                amplitude=ccf_scaled[peak_idx],
-                center=peak_rv,
-                sigma=10  # Initial guess for width
-            )
-            
-            # Add reasonable bounds for line center
-            params['center'].min = -20
-            params['center'].max = 20
-            params['sigma'].min = 2
-            params['sigma'].max = 30
-            params['amplitude'].min = 0
-            
-            # Fit only around the peak (±30 km/s for better fit)
-            fit_mask = np.abs(rv - peak_rv) < 30
-            
-            try:
-                result = model.fit(ccf_scaled[fit_mask], x=rv[fit_mask], params=params)
-                
-                # Calculate uncertainty on center: sigma / SNR
-                noise_mask = (np.abs(rv) > 50) & (~np.isnan(ccf_scaled))
-                if np.sum(noise_mask) > 10:
-                    noise_std = np.std(ccf_scaled[noise_mask])
-                    snr = result.params['amplitude'].value / noise_std
-                    center_err = result.params['sigma'].value / snr if snr > 1 else 2.0
-                else:
-                    center_err = result.params['center'].stderr or 2.0
-                
-                return {
-                    'center': result.params['center'].value,
-                    'center_err': center_err,
-                    'amplitude': result.params['amplitude'].value,
-                    'sigma': result.params['sigma'].value,
-                    'fwhm': 2.355 * result.params['sigma'].value,
-                    'result': result,
-                    'ccf_scaled': ccf_scaled  # Return scaled CCF for plotting
-                }
-            except Exception as e:
-                print(f"Fitting failed: {e}")
-                return None
+        fit_begin = DetectionAnalysis._fit_gaussian_to_ccf(rv_grid, ccf_begin)
+        fit_end = DetectionAnalysis._fit_gaussian_to_ccf(rv_grid, ccf_end)
+        fit_full = DetectionAnalysis._fit_gaussian_to_ccf(rv_grid, ccf_full)
         
-        fit_begin = fit_gaussian_to_ccf(rv_grid, ccf_begin)
-        fit_end = fit_gaussian_to_ccf(rv_grid, ccf_end)
-        fit_full = fit_gaussian_to_ccf(rv_grid, ccf_full)
+        # Plot the results
+        PlottingUtils.plot_blueshift_analysis(
+            rv_grid, ccf_begin, ccf_end, fit_begin, fit_end,
+            phases[phase_begin_mask] if np.sum(phase_begin_mask) > 0 else [],
+            phases[phase_end_mask] if np.sum(phase_end_mask) > 0 else [],
+            template_name
+        )
         
-        # Create the plot
+        # Calculate and print results
+        results = DetectionAnalysis._calculate_blueshift_results(
+            fit_begin, fit_end, fit_full, template_name
+        )
+        
+        return {
+            'fit_begin': fit_begin,
+            'fit_end': fit_end,
+            'fit_full': fit_full,
+            'ccf_begin': ccf_begin,
+            'ccf_end': ccf_end,
+            'ccf_full': ccf_full,
+            'rv_shift': results['rv_shift'],
+            'significance': results['significance'],
+            'n_early': np.sum(phase_begin_mask),
+            'n_late': np.sum(phase_end_mask)
+        }
+    
+    @staticmethod
+    def _fit_gaussian_to_ccf(rv, ccf, initial_center=0):
+        """Fit a Gaussian to a 1D CCF and return parameters"""
+        if np.all(np.isnan(ccf)):
+            return None
+        
+        ccf_scaled = ccf
+        
+        peak_idx = np.nanargmax(ccf_scaled)
+        peak_rv = rv[peak_idx]
+        
+        model = GaussianModel()
+        
+        params = model.make_params(
+            amplitude=ccf_scaled[peak_idx],
+            center=peak_rv,
+            sigma=10
+        )
+        
+        params['center'].min = -20
+        params['center'].max = 20
+        params['sigma'].min = 2
+        params['sigma'].max = 30
+        params['amplitude'].min = 0
+        
+        fit_mask = np.abs(rv - peak_rv) < 30
+        
+        try:
+            result = model.fit(ccf_scaled[fit_mask], x=rv[fit_mask], params=params)
+            
+            noise_mask = (np.abs(rv) > 50) & (~np.isnan(ccf_scaled))
+            if np.sum(noise_mask) > 10:
+                noise_std = np.std(ccf_scaled[noise_mask])
+                snr = result.params['amplitude'].value / noise_std
+                center_err = result.params['sigma'].value / snr if snr > 1 else 2.0
+            else:
+                center_err = result.params['center'].stderr or 2.0
+            
+            return {
+                'center': result.params['center'].value,
+                'center_err': center_err,
+                'amplitude': result.params['amplitude'].value,
+                'sigma': result.params['sigma'].value,
+                'fwhm': 2.355 * result.params['sigma'].value,
+                'result': result,
+                'ccf_scaled': ccf_scaled
+            }
+        except Exception as e:
+            print(f"Fitting failed: {e}")
+            return None
+    
+    @staticmethod
+    def _calculate_blueshift_results(fit_begin, fit_end, fit_full, template_name):
+        """Calculate and print blueshift analysis results"""
+        species_label = TemplateUtils.get_species_label(template_name)
+        print(f"\n{species_label} Blueshift Analysis Results:")
+        print("="*50)
+        
+        if fit_begin is not None:
+            print(f"Near ingress:")
+            print(f"  RV center: {fit_begin['center']:.2f} ± {fit_begin['center_err']:.2f} km/s")
+            print(f"  Amplitude: {fit_begin['amplitude']:.1f} ppm")
+            print(f"  FWHM: {fit_begin['fwhm']:.1f} km/s")
+        else:
+            print("Near ingress: No fit possible")
+        
+        if fit_end is not None:
+            print(f"\nNear egress:")
+            print(f"  RV center: {fit_end['center']:.2f} ± {fit_end['center_err']:.2f} km/s")
+            print(f"  Amplitude: {fit_end['amplitude']:.1f} ppm")
+            print(f"  FWHM: {fit_end['fwhm']:.1f} km/s")
+        else:
+            print("\nNear egress: No fit possible")
+        
+        rv_shift = np.nan
+        significance = np.nan
+        
+        if fit_begin is not None and fit_end is not None:
+            rv_shift = fit_end['center'] - fit_begin['center']
+            print(f"\nVelocity shift (egress - ingress): {rv_shift:.2f} km/s")
+            
+            combined_error = np.sqrt(fit_begin['center_err']**2 + fit_end['center_err']**2)
+            significance = np.abs(rv_shift) / combined_error
+            print(f"Significance: {significance:.1f}σ")
+            
+            if significance > 2:
+                print(f"✓ Significant shift detected (> 2σ)")
+            else:
+                print(f"✗ No significant shift (< 2σ)")
+        else:
+            print("\nCannot calculate velocity shift without both fits")
+        
+        return {'rv_shift': rv_shift, 'significance': significance}
+
+
+class PlottingUtils:
+    """Handles all plotting operations"""
+    
+    @staticmethod
+    def plot_kp_vsys_map(snr_grid, vsys_grid, kp_grid, template_name, system):
+        """Generate Kp-Vsys SNR map"""
+        fig, ax = plt.subplots(figsize=(7, 6))
+        
+        im = ax.imshow(snr_grid, cmap=cm.inferno, 
+                      extent=[vsys_grid[0], vsys_grid[-1], kp_grid[-1], kp_grid[0]],
+                      aspect='auto', interpolation='nearest')
+        
+        ax.set_xlabel('$v_{sys}$ (km s$^{-1}$)', fontsize=18)
+        ax.set_ylabel('$K_p$ (km s$^{-1}$)', fontsize=18)
+        
+        cb = fig.colorbar(im)
+        cb.set_label('SNR', rotation=90, fontsize=18)
+        cb.ax.tick_params(labelsize=18)
+        cb.ax.get_yaxis().labelpad = 4
+        
+        ax.plot([vsys_grid[0], vsys_grid[-1]], [system.kp, system.kp], 'k--')
+        ax.plot([0, 0], [kp_grid[0], kp_grid[-1]], 'k--')
+        
+        species_label = TemplateUtils.get_species_label(template_name)
+        ax.text(0.05, 0.05, species_label, 
+                transform=ax.transAxes,
+                fontsize=21.5,
+                fontweight='bold',
+                color='white',
+                verticalalignment='bottom',
+                horizontalalignment='left',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7))
+        
+        max_snr = np.max(snr_grid)
+        if max_snr > 5:
+            ax.text(0.975, 0.05, f'SNR = {max_snr:.1f}', 
+                transform=ax.transAxes,
+                fontsize=21.5,
+                fontweight='bold',
+                color='white',
+                verticalalignment='bottom',
+                horizontalalignment='right',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7))
+        
+        plt.xticks(fontsize=18)
+        plt.yticks(fontsize=18)
+        plt.tight_layout()
+        
+        plt.savefig(f'{template_name}_Kp-vsys.png', bbox_inches='tight')
+        plt.savefig(f'{template_name}_Kp-vsys.pdf', dpi=300, bbox_inches='tight')
+        print(f"Saved: {template_name}_Kp-vsys.pdf")
+        print(f"Saved: {template_name}_Kp-vsys.png")
+        plt.close()
+    
+    @staticmethod
+    def plot_ccf_map(rv_grid, cc_grid, data_table, transit_indices, template_name):
+        """Generate 2D CCF map"""
+        fig, ax = plt.subplots(figsize=(8.0, 3.5))
+        
+        im = ax.imshow(-cc_grid, cmap=cm.gray, 
+                      extent=[np.min(rv_grid), np.max(rv_grid), 
+                             data_table['phases'][-1], data_table['phases'][0]])
+        
+        ax.set_xlabel('Radial Velocity (km s$^{-1}$)', fontsize=14)
+        ax.set_ylabel('Orbital Phase', fontsize=14)
+        
+        t1, t2 = transit_indices
+        ax.plot([-200, 200], [data_table['phases'][t1], data_table['phases'][t1]], 
+                color='cyan', linestyle='--', linewidth=3)
+        ax.plot([-200, 200], [data_table['phases'][t2], data_table['phases'][t2]], 
+                color='cyan', linestyle='--', linewidth=3)
+        
+        ax.plot(data_table['planet_rvs'][t2:], data_table['phases'][t2:], 
+                color='lime', linestyle=':', linewidth=6)
+        ax.plot(data_table['planet_rvs'][:t1], data_table['phases'][:t1], 
+                color='lime', linestyle=':', linewidth=6)
+        
+        ax.set_xlim(-150, 150)
+        ax.set_aspect(1100)
+        
+        cb = fig.colorbar(im)
+        cb.set_label('Amplitude (ppm)', rotation=270, fontsize=18)
+        cb.ax.tick_params(labelsize=14)
+        cb.ax.get_yaxis().labelpad = 15
+        
+        plt.xticks(fontsize=14)
+        plt.yticks(fontsize=14)
+        plt.tight_layout()
+        
+        plt.savefig(f'{template_name}_SRF.png')
+        print(f"Saved: {template_name}_SRF.png")
+        plt.close()
+    
+    @staticmethod
+    def plot_planet_rest_frame(rv_grid, cc_grid, data_table, transit_indices, template_name):
+        """Generate planet rest frame plot"""
+        new_vel, cc_planet = CrossCorrelation.shift_ccf_to_planet_frame(
+            rv_grid, cc_grid, data_table['planet_rvs']
+        )
+        
+        phases_sorted = np.sort(data_table['phases'])
+        cc_planet_sorted = cc_planet[np.argsort(data_table['phases']), :]
+        
+        extent = [new_vel[0], new_vel[-1], phases_sorted[0], phases_sorted[-1]]
+        
+        species_label = TemplateUtils.get_species_label(template_name)
+        
+        color_schemes = [('gray_r', 'Gray Inverted')]
+        
+        for cmap_name, cmap_label in color_schemes:
+            # PDF version
+            fig, ax = plt.subplots(figsize=(8, 3.5))
+            
+            im = ax.imshow(cc_planet_sorted,
+                           cmap=cmap_name,
+                           origin='lower',
+                           interpolation='None',
+                           rasterized=True,
+                           extent=extent,
+                           aspect='auto')
+            
+            ax.set_xlim(-100, 100)
+            ax.axvline(0, color='lime', linestyle=':', linewidth=6)
+            
+            ax.set_xlabel('Radial Velocity in Planet Rest Frame (km s$^{-1}$)', fontsize=18)
+            ax.set_ylabel('Orbital Phase', fontsize=18)
+            
+            t1, t2 = transit_indices
+            ax.plot([-200, 200], [data_table['phases'][t1], data_table['phases'][t1]], 
+                    color='darkblue', linestyle='--', linewidth=3)
+            ax.plot([-200, 200], [data_table['phases'][t2], data_table['phases'][t2]], 
+                    color='magenta', linestyle='--', linewidth=3)
+            
+            ax.text(0.05, 0.95, species_label, 
+                    transform=ax.transAxes,
+                    fontsize=24,
+                    fontweight='bold',
+                    color='white',
+                    verticalalignment='top',
+                    horizontalalignment='left',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7))
+            
+            cb = fig.colorbar(im)
+            cb.set_label('Amplitude (ppm)', fontsize=18)
+            cb.ax.tick_params(labelsize=18)
+            cb.ax.get_yaxis().labelpad = 15
+            
+            plt.xticks(fontsize=14)
+            plt.yticks(fontsize=14)
+            plt.tight_layout()
+            
+            cmap_suffix = cmap_label.lower().replace(' ', '_')
+            filename = f'{template_name}_prf_{cmap_suffix}_pm100.pdf'
+            
+            plt.savefig(filename, dpi=300, bbox_inches='tight')
+            print(f"Saved: {filename}")
+            plt.close()
+            
+            # PNG version
+            fig, ax = plt.subplots(figsize=(8, 3.5))
+            
+            im = ax.imshow(cc_planet_sorted,
+                           cmap=cmap_name,
+                           origin='lower',
+                           interpolation='None',
+                           rasterized=True,
+                           extent=extent,
+                           aspect='auto')
+            
+            ax.set_xlim(-100, 100)
+            ax.axvline(0, color='lime', linestyle=':', linewidth=6)
+            ax.set_xlabel('Radial Velocity in Planet Rest Frame (km s$^{-1}$)', fontsize=18)
+            ax.set_ylabel('Orbital Phase', fontsize=18)
+            
+            ax.plot([-200, 200], [data_table['phases'][t1], data_table['phases'][t1]], 
+                    color='darkblue', linestyle='--', linewidth=3)
+            ax.plot([-200, 200], [data_table['phases'][t2], data_table['phases'][t2]], 
+                    color='magenta', linestyle='--', linewidth=3)
+            
+            ax.text(0.05, 0.95, species_label, 
+                    transform=ax.transAxes,
+                    fontsize=24,
+                    fontweight='bold',
+                    color='white',
+                    verticalalignment='top',
+                    horizontalalignment='left',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7))
+            
+            cb = fig.colorbar(im)
+            cb.set_label('Amplitude (ppm)', fontsize=18)
+            cb.ax.tick_params(labelsize=18)
+            cb.ax.get_yaxis().labelpad = 15
+            
+            plt.xticks(fontsize=14)
+            plt.yticks(fontsize=14)
+            plt.tight_layout()
+            
+            filename = f'{template_name}_prf_{cmap_suffix}_pm100.png'
+            
+            plt.savefig(filename, dpi=300, bbox_inches='tight')
+            print(f"Saved: {filename}")
+            plt.close()
+    
+    @staticmethod
+    def plot_blueshift_analysis(rv_grid, ccf_begin, ccf_end, fit_begin, fit_end,
+                               phase_begin_range, phase_end_range, template_name):
+        """Create blueshift analysis plot"""
         fig, ax = plt.subplots(figsize=(8.0, 3.5))
         
         # Get phase ranges for legend labels
-        phase_begin_range = phases[phase_begin_mask]
-        phase_end_range = phases[phase_end_mask]
-        
         if len(phase_begin_range) > 0:
             phi_begin_str = f'φ = {np.min(phase_begin_range):.3f} to {np.max(phase_begin_range):.3f}'
         else:
@@ -653,7 +818,7 @@ class Atmosphere:
         else:
             phi_end_str = 'φ = late'
         
-        # Plot 1D CCFs without Gaussian fits
+        # Plot 1D CCFs
         if fit_begin is not None:
             ax.plot(rv_grid, ccf_begin, color='magenta', linewidth=2, 
                      label=f'{phi_begin_str}')
@@ -677,16 +842,15 @@ class Atmosphere:
         ax.set_xlabel('Radial Velocity in Planet Rest Frame (km s$^{-1}$)', fontsize=18)
         ax.set_ylabel('Amplitude (ppm)', fontsize=18)
         
-        # Keep the original legend in upper right with styling
+        # Phase legend
         phase_legend = ax.legend(loc='upper right', fontsize=14, frameon=True, fancybox=True, 
                                shadow=True, framealpha=0.9)
-        ax.add_artist(phase_legend)  # This preserves the phase range legend
+        ax.add_artist(phase_legend)
         
         ax.grid(True, alpha=0.3)
         
-        # Add velocity legend in top left, aligned with right-side legend
+        # Add velocity legend
         if fit_begin is not None and fit_end is not None:
-            # Create custom legend entries with dashed lines and colored text
             from matplotlib.lines import Line2D
             legend_elements = [
                 Line2D([0], [0], color='magenta', linestyle='--', linewidth=2, 
@@ -723,394 +887,87 @@ class Atmosphere:
         plt.yticks(fontsize=14)
         plt.tight_layout()
         
-        species_label = self.get_species_label(template_name)
-        print(f"\n{species_label} Blueshift Analysis Results:")
-        print("="*50)
-        
-        if fit_begin is not None:
-            print(f"Near ingress:")
-            print(f"  RV center: {fit_begin['center']:.2f} ± {fit_begin['center_err']:.2f} km/s")
-            print(f"  Amplitude: {fit_begin['amplitude']:.1f} ppm")
-            print(f"  FWHM: {fit_begin['fwhm']:.1f} km/s")
-        else:
-            print("Near ingress: No fit possible")
-        
-        if fit_end is not None:
-            print(f"\nNear egress:")
-            print(f"  RV center: {fit_end['center']:.2f} ± {fit_end['center_err']:.2f} km/s")
-            print(f"  Amplitude: {fit_end['amplitude']:.1f} ppm")
-            print(f"  FWHM: {fit_end['fwhm']:.1f} km/s")
-        else:
-            print("\nNear egress: No fit possible")
-        
-        if fit_begin is not None and fit_end is not None:
-            rv_shift = fit_end['center'] - fit_begin['center']
-            print(f"\nVelocity shift (egress - ingress): {rv_shift:.2f} km/s")
-            
-            # Calculate significance of the shift
-            combined_error = np.sqrt(fit_begin['center_err']**2 + fit_end['center_err']**2)
-            significance = np.abs(rv_shift) / combined_error
-            print(f"Significance: {significance:.1f}σ")
-            
-            if significance > 2:
-                print(f"✓ Significant shift detected (> 2σ)")
-            else:
-                print(f"✗ No significant shift (< 2σ)")
-        else:
-            print("\nCannot calculate velocity shift without both fits")
-            rv_shift = np.nan
-            significance = np.nan
-        
-        # Save figures
         plt.savefig(f'{template_name}_blueshift_analysis.pdf', dpi=300, bbox_inches='tight')
         plt.savefig(f'{template_name}_blueshift_analysis.png', dpi=300, bbox_inches='tight')
         plt.close()
-        
-        return {
-            'fit_begin': fit_begin,
-            'fit_end': fit_end,
-            'fit_full': fit_full,
-            'ccf_begin': ccf_begin,
-            'ccf_end': ccf_end,
-            'ccf_full': ccf_full,
-            'rv_shift': rv_shift if 'rv_shift' in locals() else np.nan,
-            'significance': significance if 'significance' in locals() else np.nan,
-            'n_early': np.sum(phase_begin_mask),
-            'n_late': np.sum(phase_end_mask)
-        }
 
-    def load_data(self):
-        """
-        Load and process observational data
+class TemplateUtils:
+    """Utilities for template processing"""
+    
+    @staticmethod
+    def get_species_label(template_name):
+        """Convert template name to proper species label"""
+        clean_name = template_name.replace('_custom', '').replace('.dat', '')
+        template_lower = clean_name.lower()
         
-        Returns
-        -------
-        data_table : astropy.table.Table
-            Processed data table
-        """
-        print(f"Loading data from pattern: {self.file_pattern}")
-        file_list = glob.glob(self.file_pattern)
+        species_map = {
+            'na_lor_cut': 'Na I', 'na_allard': 'Na I', 
+            'na_allard_new': 'Na I', 'na_burrows': 'Na I', 'na': 'Na I',
+            'ca+': 'Ca II', 'ca': 'Ca I', 
+            'fe+': 'Fe+', 'fe': 'Fe I',
+            'mg+': 'Mg+', 'mg': 'Mg I',
+            'k': 'K I',
+            'ti': 'Ti I',
+            'v': 'V I',
+            'si': 'Si I',
+            'cr_agss09': 'Cr I', 'cr': 'Cr I',
+            'tio_48_exomol_mckemmish': 'TiO',
+            'vo': 'VO',
+            'cah': 'CaH',
+            'feh_main_iso': 'FeH'
+        }
         
-        if len(file_list) == 0:
-            raise FileNotFoundError(f"No files found matching pattern: {self.file_pattern}")
+        if template_lower in species_map:
+            return species_map[template_lower]
         
-        print(f"Found {len(file_list)} files")
+        for key, label in species_map.items():
+            if key in template_lower:
+                return label
         
-        combined_fluxes = []
-        rest_waves = []
-        phases = []
-        planet_rvs = []
-        barycentric_corrections = []
-        bjds = []
-        stellar_rvs = []
-        
-        for file_path in file_list:
-            with fits.open(file_path, memmap=False) as hdul:
-                # Read science fibers
-                wave_1 = hdul['WAVE_INTERP_SCI1'].data
-                flux_1 = hdul['FLUX_INTERP_SCI1'].data
-                wave_2 = hdul['WAVE_INTERP_SCI2'].data
-                flux_2 = hdul['FLUX_INTERP_SCI2'].data
-                wave_3 = hdul['WAVE_INTERP_SCI3'].data
-                flux_3 = hdul['FLUX_INTERP_SCI3'].data
-                
-                # Combine fibers
-                interp_func1 = inter.CubicSpline(wave_1, flux_1)
-                interp_func2 = inter.CubicSpline(wave_2, flux_2)
-                combined_flux = np.nanmean([flux_3, interp_func1(wave_3), 
-                                          interp_func2(wave_3)], axis=0)
-                
-                # Time and velocity corrections
-                obs_time = hdul[0].header['DATE-MID']
-                t_astropy = time.Time(obs_time, format='isot', scale='utc', 
-                                    location=self.system.observatory)
-                ltt_bary = t_astropy.light_travel_time(self.system.coordinates)
-                bjd = (t_astropy.tdb + ltt_bary).jd
-                
-                vbar_corr = self.system.coordinates.radial_velocity_correction(obstime=t_astropy)
-                vbar = vbar_corr.to(u.km/u.s).value
-                
-                phase = self.calculate_orbital_phase(bjd)
-                stellar_rv = self.calculate_planet_rv(self.system.k_star, phase)
-                
-                # Apply velocity corrections to wavelengths
-                rest_wave = wave_3 / (1 + (-vbar + self.system.vsys - stellar_rv) / (2.99792e5))
-                
-                combined_fluxes.append(combined_flux)
-                rest_waves.append(rest_wave)
-                phases.append(phase)
-                planet_rvs.append(self.calculate_planet_rv(self.system.kp, phase))
-                barycentric_corrections.append(vbar)
-                bjds.append(bjd)
-                stellar_rvs.append(stellar_rv)
-        
-        self.data_table = Table({
-            'flux': combined_fluxes,
-            'waves': rest_waves,
-            'phases': phases,
-            'planet_rvs': planet_rvs,
-            'barycentric_corrections': barycentric_corrections,
-            'bjds': bjds,
-            'stellar_rvs': stellar_rvs
-        })
-        
-        self.data_table.sort('bjds')
-        self.data_table.reverse()
-        
-        transit_half_width = self.system.transit_phase_half_width
-        if self.data_table['phases'][0] > transit_half_width:
-            transit_start = np.where(self.data_table['phases'] < transit_half_width)[0][0]
-        else:
-            transit_start = 0
+        return clean_name.replace('_', ' ').title()
+    
+    @staticmethod
+    def load_template(template_path):
+        """Load atmospheric template from file"""
+        try:
+            template_data = ascii.read(template_path)
+            if 'Wavelength' not in template_data.colnames or 'Radius' not in template_data.colnames:
+                raise ValueError("Template must have 'Wavelength' and 'Radius' columns")
             
-        if self.data_table['phases'][-1] < -transit_half_width:
-            transit_end = np.where(self.data_table['phases'] < -transit_half_width)[0][0]
-        else:
-            transit_end = len(self.data_table)
-        
-        self.transit_indices = [transit_start, transit_end]
-        
-        print(f"Data loaded successfully:")
-        print(f"  Number of observations: {len(self.data_table)}")
-        print(f"  Phase range: {np.min(self.data_table['phases']):.4f} to {np.max(self.data_table['phases']):.4f}")
-        print(f"  Transit indices: {self.transit_indices}")
-        
+            return template_data['Wavelength'], template_data['Radius']
+        except Exception as e:
+            print(f"Error loading template: {e}")
+            return None, None
+
+class Atmosphere:
+    """Main atmospheric analysis class"""
+    
+    def __init__(self, system, file_pattern="latestDRP/*L1.fits"):
+        self.system = system
+        self.file_pattern = file_pattern
+        self.data_table = None
+        self.clean_wave_grid = None
+        self.clean_flux_grid = None
+        self.transit_indices = None
+    
+    def load_data(self):
+        """Load and process observational data"""
+        self.data_table, self.transit_indices = DataLoader.load_observations(
+            self.file_pattern, self.system
+        )
         return self.data_table
     
-    def _plot_kp_vsys_map(self, snr_grid, vsys_grid, kp_grid, template_name):
-        """Generate Kp-Vsys SNR map"""
-        fig, ax = plt.subplots(figsize=(7, 6))
-        
-        im = ax.imshow(snr_grid, cmap=cm.inferno, 
-                      extent=[vsys_grid[0], vsys_grid[-1], kp_grid[-1], kp_grid[0]],
-                      aspect='auto', interpolation='nearest')
-        
-        ax.set_xlabel('$v_{sys}$ (km s$^{-1}$)', fontsize=18)
-        ax.set_ylabel('$K_p$ (km s$^{-1}$)', fontsize=18)
-        
-        cb = fig.colorbar(im)
-        cb.set_label('SNR', rotation=90, fontsize=18)
-        cb.ax.tick_params(labelsize=18)
-        cb.ax.get_yaxis().labelpad = 4
-        
-        ax.plot([vsys_grid[0], vsys_grid[-1]], [self.system.kp, self.system.kp], 'k--')
-        ax.plot([0, 0], [kp_grid[0], kp_grid[-1]], 'k--')
-        
-        species_label = self.get_species_label(template_name)
-        ax.text(0.05, 0.05, species_label, 
-                transform=ax.transAxes,
-                fontsize=21.5,
-                fontweight='bold',
-                color='white',
-                verticalalignment='bottom',
-                horizontalalignment='left',
-                bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7))
-        
-        # Add maximum SNR value in bottom right corner
-        max_snr = np.max(snr_grid)
-        if max_snr > 5:
-            ax.text(0.975, 0.05, f'SNR = {max_snr:.1f}', 
-                transform=ax.transAxes,
-                fontsize=21.5,
-                fontweight='bold',
-                color='white',
-                verticalalignment='bottom',
-                horizontalalignment='right',
-                bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7))
-        
-        plt.xticks(fontsize=18)
-        plt.yticks(fontsize=18)
-        plt.tight_layout()
-        
-        plt.savefig(f'{template_name}_Kp-vsys.png', bbox_inches='tight')
-        plt.savefig(f'{template_name}_Kp-vsys.pdf', dpi=300, bbox_inches='tight')
-        print(f"Saved: {template_name}_Kp-vsys.pdf")
-        print(f"Saved: {template_name}_Kp-vsys.png")
-        plt.close()
-        
-    def _plot_ccf_map(self, rv_grid, cc_grid, template_name, output_path):
-        """Generate 2D CCF map"""
-        fig, ax = plt.subplots(figsize=(8.0, 3.5))
-        
-        im = ax.imshow(-cc_grid, cmap=cm.gray_r, 
-                      extent=[np.min(rv_grid), np.max(rv_grid), 
-                             self.data_table['phases'][-1], self.data_table['phases'][0]])
-        
-        ax.set_xlabel('Radial Velocity (km s$^{-1}$)', fontsize=14)
-        ax.set_ylabel('Orbital Phase', fontsize=14)
-        
-        # Transit boundaries
-        t1, t2 = self.transit_indices
-        ax.plot([-200, 200], [self.data_table['phases'][t1], self.data_table['phases'][t1]], 
-                color='cyan', linestyle='--', linewidth=3)
-        ax.plot([-200, 200], [self.data_table['phases'][t2], self.data_table['phases'][t2]], 
-                color='cyan', linestyle='--', linewidth=3)
-        
-        ax.plot(self.data_table['planet_rvs'][t2:], self.data_table['phases'][t2:], 
-                color='lime', linestyle=':', linewidth=6)
-        ax.plot(self.data_table['planet_rvs'][:t1], self.data_table['phases'][:t1], 
-                color='lime', linestyle=':', linewidth=6)
-        
-        ax.set_xlim(-150, 150)
-        ax.set_aspect(1100)
-        
-        cb = fig.colorbar(im)
-        cb.set_label('Amplitude (ppm)', rotation=270, fontsize=18)
-        cb.ax.tick_params(labelsize=14)
-        cb.ax.get_yaxis().labelpad = 15
-        
-        plt.xticks(fontsize=14)
-        plt.yticks(fontsize=14)
-        plt.tight_layout()
-        
-        plt.savefig(f'{template_name}_SRF.png')
-        print(f"Saved: {template_name}_SRF.png")
-        plt.close()
-    
-    def _plot_planet_rest_frame(self, rv_grid, cc_grid, template_name, output_path):
-        """Generate planet rest frame plot"""
-        # Shift to planet rest frame
-        new_vel, cc_planet = self.shift_ccf_to_planet_frame(rv_grid, cc_grid, self.data_table['planet_rvs'])
-        
-        phases_sorted = np.sort(self.data_table['phases'])
-        cc_planet_sorted = cc_planet[np.argsort(self.data_table['phases']), :]
-        
-        extent = [new_vel[0], new_vel[-1], phases_sorted[0], phases_sorted[-1]]
-        
-        species_label = self.get_species_label(template_name)
-        
-        color_schemes = [('gray', 'Gray')]
-        
-        for cmap_name, cmap_label in color_schemes:
-            fig, ax = plt.subplots(figsize=(8, 3.5))
-            
-            im = ax.imshow(cc_planet_sorted,
-                           cmap=cmap_name,
-                           origin='lower',
-                           interpolation='None',
-                           rasterized=True,
-                           extent=extent,
-                           aspect='auto')
-            
-            ax.set_xlim(-100, 100)
-            ax.axvline(0, color='lime', linestyle=':', linewidth=6)
-            
-            ax.set_xlabel('Radial Velocity in Planet Rest Frame (km s$^{-1}$)', fontsize=18)
-            ax.set_ylabel('Orbital Phase', fontsize=18)
-            
-            t1, t2 = self.transit_indices
-            ax.plot([-200, 200], [self.data_table['phases'][t1], self.data_table['phases'][t1]], 
-                    color='darkblue', linestyle='--', linewidth=3)
-            ax.plot([-200, 200], [self.data_table['phases'][t2], self.data_table['phases'][t2]], 
-                    color='magenta', linestyle='--', linewidth=3)
-            
-            ax.text(0.05, 0.95, species_label, 
-                    transform=ax.transAxes,
-                    fontsize=24,
-                    fontweight='bold',
-                    color='white',
-                    verticalalignment='top',
-                    horizontalalignment='left',
-                    bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7))
-            
-            cb = fig.colorbar(im)
-            cb.set_label('Amplitude (ppm)', fontsize=18)
-            cb.ax.tick_params(labelsize=18)
-            cb.ax.get_yaxis().labelpad = 15
-            
-            plt.xticks(fontsize=14)
-            plt.yticks(fontsize=14)
-            plt.tight_layout()
-            
-            cmap_suffix = cmap_label.lower().replace(' ', '_')
-            filename = f'{template_name}_prf_{cmap_suffix}_pm100.pdf'
-            
-            plt.savefig(filename, dpi=300, bbox_inches='tight')
-            print(f"Saved: {filename}")
-            plt.close()
-        
-        for cmap_name, cmap_label in color_schemes:
-            fig, ax = plt.subplots(figsize=(8, 3.5))
-            
-            im = ax.imshow(cc_planet_sorted,
-                           cmap=cmap_name,
-                           origin='lower',
-                           interpolation='None',
-                           rasterized=True,
-                           extent=extent,
-                           aspect='auto')
-            
-            ax.set_xlim(-100, 100)
-            ax.axvline(0, color='lime', linestyle=':', linewidth=6)
-            ax.set_xlabel('Radial Velocity in Planet Rest Frame (km s$^{-1}$)', fontsize=18)
-            ax.set_ylabel('Orbital Phase', fontsize=18)
-            
-            t1, t2 = self.transit_indices
-            ax.plot([-200, 200], [self.data_table['phases'][t1], self.data_table['phases'][t1]], 
-                    color='darkblue', linestyle='--', linewidth=3)
-            ax.plot([-200, 200], [self.data_table['phases'][t2], self.data_table['phases'][t2]], 
-                    color='magenta', linestyle='--', linewidth=3)
-            
-            ax.text(0.05, 0.95, species_label, 
-                    transform=ax.transAxes,
-                    fontsize=24,
-                    fontweight='bold',
-                    color='white',
-                    verticalalignment='top',
-                    horizontalalignment='left',
-                    bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7))
-            
-            cb = fig.colorbar(im)
-            cb.set_label('Amplitude (ppm)', fontsize=18)
-            cb.ax.tick_params(labelsize=18)
-            cb.ax.get_yaxis().labelpad = 15
-            
-            plt.xticks(fontsize=14)
-            plt.yticks(fontsize=14)
-            plt.tight_layout()
-            
-            cmap_suffix = cmap_label.lower().replace(' ', '_')
-            filename = f'{template_name}_prf_{cmap_suffix}_pm100.png'
-            
-            plt.savefig(filename, dpi=300, bbox_inches='tight')
-            print(f"Saved: {filename}")
-            plt.close()
-    
     def process_template(self, template_path, output_dir=".", include_blueshift_analysis=True):
-        """
-        Process a single atmospheric template
-        
-        Parameters
-        ----------
-        template_path : str
-            Path to template file
-        output_dir : str
-            Directory for output files
-        include_blueshift_analysis : bool
-            Whether to perform blueshift analysis
-            
-        Returns
-        -------
-        results : dict
-            Analysis results
-        """
-        # Extract template name
+        """Process a single atmospheric template"""
         template_name = Path(template_path).stem
         
         print(f"\nProcessing template: {template_name}")
         print(f"Template file: {template_path}")
         
         # Load template
-        try:
-            template_data = ascii.read(template_path)
-            if 'Wavelength' not in template_data.colnames or 'Radius' not in template_data.colnames:
-                raise ValueError("Template must have 'Wavelength' and 'Radius' columns")
-        except Exception as e:
-            print(f"Error loading template: {e}")
+        model_wave, model_flux = TemplateUtils.load_template(template_path)
+        if model_wave is None:
             return None
-        
-        model_wave = template_data['Wavelength']
-        model_flux = template_data['Radius']
         
         print(f"Template wavelength range: {model_wave.min():.1f} - {model_wave.max():.1f} Å")
         
@@ -1120,38 +977,40 @@ class Atmosphere:
         
         if self.clean_wave_grid is None or self.clean_flux_grid is None:
             print("Cleaning spectra...")
-            self.clean_wave_grid, self.clean_flux_grid = self.clean_spectra(
+            self.clean_wave_grid, self.clean_flux_grid = SpectralCleaner.clean_spectra(
                 np.array(self.data_table['waves']), 
                 np.array(self.data_table['flux']),
                 self.transit_indices,
                 do_pca=True,
-                pca_components=6
+                pca_components=5
             )
         
-        # Cross-correlate (no scaling applied)
-        rv_grid, cc_grid = self.cross_correlate(
+        # Cross-correlate
+        rv_grid, cc_grid = CrossCorrelation.cross_correlate(
             self.clean_wave_grid, self.clean_flux_grid,
-            model_wave, model_flux, self.transit_indices
+            model_wave, model_flux, self.transit_indices, self.system
         )
         cc_grid = np.array(cc_grid)
         
         # Find best parameters
-        snr_grid, vsys_grid, kp_grid = self.find_best_kp_vsys(
-            rv_grid, cc_grid, self.data_table['phases'], template_name
+        snr_grid, vsys_grid, kp_grid = DetectionAnalysis.find_best_kp_vsys(
+            rv_grid, cc_grid, self.data_table['phases'], self.system, template_name
         )
         
         # Generate plots
         output_path = Path(output_dir)
         output_path.mkdir(exist_ok=True)
         
-        self._plot_ccf_map(rv_grid, cc_grid, template_name, output_path)
-        self._plot_planet_rest_frame(rv_grid, cc_grid, template_name, output_path)
+        PlottingUtils.plot_ccf_map(rv_grid, cc_grid, self.data_table, 
+                                   self.transit_indices, template_name)
+        PlottingUtils.plot_planet_rest_frame(rv_grid, cc_grid, self.data_table,
+                                            self.transit_indices, template_name)
         
         # Add blueshift analysis
         blueshift_results = None
         if include_blueshift_analysis:
             try:
-                blueshift_results = self.analyze_blueshift_phase_by_phase(
+                blueshift_results = DetectionAnalysis.analyze_blueshift_phase_by_phase(
                     rv_grid, cc_grid, self.data_table['phases'], 
                     self.transit_indices, self.system.kp, self.system.vsys, template_name
                 )
@@ -1161,7 +1020,7 @@ class Atmosphere:
         
         results = {
             'template_name': template_name,
-            'species_label': self.get_species_label(template_name),
+            'species_label': TemplateUtils.get_species_label(template_name),
             'rv_grid': rv_grid,
             'cc_grid': cc_grid,
             'snr_grid': snr_grid,
@@ -1176,23 +1035,7 @@ class Atmosphere:
     
     def process_all_templates(self, template_dir="templates", output_dir="results", 
                             include_blueshift_analysis=True):
-        """
-        Process all templates in a directory
-        
-        Parameters
-        ----------
-        template_dir : str
-            Directory containing template files
-        output_dir : str
-            Directory for output files
-        include_blueshift_analysis : bool
-            Whether to perform blueshift analysis
-            
-        Returns
-        -------
-        all_results : list
-            List of results dictionaries
-        """
+        """Process all templates in a directory"""
         template_pattern = os.path.join(template_dir, "*.dat")
         template_files = glob.glob(template_pattern)
         
@@ -1230,7 +1073,6 @@ class Atmosphere:
         
         return all_results
 
-
 if __name__ == "__main__":
     from astropy import coordinates as coord, units as u
     
@@ -1240,12 +1082,12 @@ if __name__ == "__main__":
     
     wasp76b_system = Planet(
         name="WASP-76b",
-        t0=2457273.4191,  # BJD_TDB from Kokori et al.
-        period=1.8098806,  # days from Kokori et al.
-        kp=196.52,  # km/s from Ehrenreich et al. 2020
-        k_star=0.1156,  # km/s from Ehrenreich et al. 2020
-        vsys=-1.167,  # km/s from Ehrenreich et al. 2020
-        stellar_radius=1.756,  # solar radii from Gaia DR2
+        t0=2457273.4191,
+        period=1.8098806,
+        kp=196.52,
+        k_star=0.1156,
+        vsys=-1.167,
+        stellar_radius=1.756,
         coordinates=star_coords,
         observatory=keck,
         transit_phase_half_width=0.04
