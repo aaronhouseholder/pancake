@@ -1,3 +1,12 @@
+"""
+This code closely follows the methods presented in Kesseli et al. (2021, 2022) for
+detecting atmospheric species in high-resolution spectra using cross-correlation
+techniques. Much of the code has been adapted from those papers for use with KPF data,
+so please cite those papers if you find this useful:
+- Kesseli et al. (2021): "Confirmation of Asymmetric Iron Absorption in WASP-76b with HARPS"
+- Kesseli et al. (2022): "An Atomic Spectral Survey of WASP-76b: Resolving Chemical Gradients and Asymmetries"
+"""
+
 from astropy.io import fits, ascii
 import matplotlib.pyplot as plt
 import numpy as np
@@ -211,22 +220,21 @@ class SpectralCleaner:
     @staticmethod
     def clean_spectra(waves, fluxes, transit_indices, do_pca=True, 
                      pca_components=5, plots=False):
-        """Complete spectral cleaning pipeline"""
-        print("Starting spectral cleaning pipeline...")
+        print("Starting addition cleaning pipeline...")
         
-        # Step 1: Remove low flux regions (order gaps)
+        # Remove low flux regions (order gaps)
         avg_flux = np.nanmean(fluxes, axis=0)
         low_flux_mask = avg_flux > 0.05
         waves_clipped = waves[:, low_flux_mask]
         fluxes_clipped = fluxes[:, low_flux_mask]
         
-        # Step 2: Normalize spectra
+        # Normalize spectra
         norm_fluxes = fluxes_clipped / np.nanmean(fluxes_clipped, axis=1, keepdims=True)
         
-        # Step 3: Sigma clipping
+        # Sigma clipping
         sigma_clipped = SpectralCleaner._remove_vertical_outliers(norm_fluxes, 3)
         
-        # Step 4: Remove broadband variations
+        # Remove broadband variations
         blaze_removed = np.zeros_like(norm_fluxes)
         out_of_transit = np.concatenate((sigma_clipped[:transit_indices[0]], 
                                        sigma_clipped[transit_indices[1]:]), axis=0)
@@ -238,7 +246,7 @@ class SpectralCleaner:
             blaze = gaussian_filter1d(cont_rem_spec[i], 200)
             blaze_removed[i] = sigma_clipped[i] / blaze
         
-        # Step 5: Interpolate onto common grid
+        # Interpolate onto common grid
         wave_grid = np.nanmean(waves_clipped, axis=0)
         wave_grid = wave_grid[20:-20]  # Avoid extrapolation at edges
         interp_fluxes = np.ones((len(waves_clipped), len(wave_grid)))
@@ -247,19 +255,19 @@ class SpectralCleaner:
             func = inter.CubicSpline(waves_clipped[i], blaze_removed[i])
             interp_fluxes[i] = func(wave_grid)
         
-        # Step 6: PCA (optional)
+        # PCA (optional)
         if do_pca:
             pca_cleaned = SpectralCleaner._apply_pca_cleaning(interp_fluxes, pca_components)
         else:
             pca_cleaned = interp_fluxes
         
-        # Step 7: Remove high-variance columns
+        # Remove high-variance columns
         std_cols = np.nanstd(pca_cleaned, axis=0)
         mask = std_cols < 1.3 * np.nanmean(std_cols)
         wave_grid_final = wave_grid[mask]
         cleaned_flux = pca_cleaned[:, mask]
         
-        # Step 8: Final sigma clipping
+        # Final sigma clipping
         final_cleaned = SpectralCleaner._remove_vertical_outliers(cleaned_flux, 3)
         
         print(f"Cleaning complete. Final grid: {len(wave_grid_final)} wavelength points")
@@ -434,11 +442,10 @@ class DetectionAnalysis:
     @staticmethod
     def analyze_blueshift_phase_by_phase(rv_grid, cc_grid, phases, transit_indices, 
                                        kp, vsys, template_name='unknown'):
-        """Analyze the blueshift of signal by fitting Gaussians"""
-        print(f"Phase range in data: {np.min(phases):.4f} to {np.max(phases):.4f}")
-        print(f"Number of observations: {len(phases)}")
-        print(f"Transit indices: {transit_indices}")
-        
+        """
+        Analyze the blueshift of signal by fitting Gaussians
+        NOTE: Gaussian fits likely require some tuning based on visual line shapes
+        """
         cc_planet_frame = []
         
         for i in range(len(cc_grid)):
@@ -454,19 +461,14 @@ class DetectionAnalysis:
         phase_begin_mask = (phases >= -0.04) & (phases <= -0.02)
         phase_end_mask = (phases >= 0.02) & (phases <= 0.04)
         
-        print(f"Observations in beginning of transit: {np.sum(phase_begin_mask)}")
-        print(f"Observations in end of transit: {np.sum(phase_end_mask)}")
-        
         if np.sum(phase_begin_mask) > 0:
             ccf_begin = np.nanmean(cc_planet_frame[phase_begin_mask], axis=0)
         else:
-            print("ERROR: No data for beginning of transit")
             return None
             
         if np.sum(phase_end_mask) > 0:
             ccf_end = np.nanmean(cc_planet_frame[phase_end_mask], axis=0)
         else:
-            print("ERROR: No data for end of transit")
             return None
         
         in_transit_mask = np.zeros(len(phases), dtype=bool)
@@ -477,7 +479,6 @@ class DetectionAnalysis:
         fit_end = DetectionAnalysis._fit_gaussian_to_ccf(rv_grid, ccf_end)
         fit_full = DetectionAnalysis._fit_gaussian_to_ccf(rv_grid, ccf_full)
         
-        # Plot the results
         PlottingUtils.plot_blueshift_analysis(
             rv_grid, ccf_begin, ccf_end, fit_begin, fit_end,
             phases[phase_begin_mask] if np.sum(phase_begin_mask) > 0 else [],
@@ -485,23 +486,7 @@ class DetectionAnalysis:
             template_name
         )
         
-        # Calculate and print results
-        results = DetectionAnalysis._calculate_blueshift_results(
-            fit_begin, fit_end, fit_full, template_name
-        )
-        
-        return {
-            'fit_begin': fit_begin,
-            'fit_end': fit_end,
-            'fit_full': fit_full,
-            'ccf_begin': ccf_begin,
-            'ccf_end': ccf_end,
-            'ccf_full': ccf_full,
-            'rv_shift': results['rv_shift'],
-            'significance': results['significance'],
-            'n_early': np.sum(phase_begin_mask),
-            'n_late': np.sum(phase_end_mask)
-        }
+        return True
     
     @staticmethod
     def _fit_gaussian_to_ccf(rv, ccf, initial_center=0):
@@ -551,51 +536,7 @@ class DetectionAnalysis:
                 'ccf_scaled': ccf_scaled
             }
         except Exception as e:
-            print(f"Fitting failed: {e}")
             return None
-    
-    @staticmethod
-    def _calculate_blueshift_results(fit_begin, fit_end, fit_full, template_name):
-        """Calculate and print blueshift analysis results"""
-        species_label = TemplateUtils.get_species_label(template_name)
-        print(f"\n{species_label} Blueshift Analysis Results:")
-        print("="*50)
-        
-        if fit_begin is not None:
-            print(f"Near ingress:")
-            print(f"  RV center: {fit_begin['center']:.2f} ± {fit_begin['center_err']:.2f} km/s")
-            print(f"  Amplitude: {fit_begin['amplitude']:.1f} ppm")
-            print(f"  FWHM: {fit_begin['fwhm']:.1f} km/s")
-        else:
-            print("Near ingress: No fit possible")
-        
-        if fit_end is not None:
-            print(f"\nNear egress:")
-            print(f"  RV center: {fit_end['center']:.2f} ± {fit_end['center_err']:.2f} km/s")
-            print(f"  Amplitude: {fit_end['amplitude']:.1f} ppm")
-            print(f"  FWHM: {fit_end['fwhm']:.1f} km/s")
-        else:
-            print("\nNear egress: No fit possible")
-        
-        rv_shift = np.nan
-        significance = np.nan
-        
-        if fit_begin is not None and fit_end is not None:
-            rv_shift = fit_end['center'] - fit_begin['center']
-            print(f"\nVelocity shift (egress - ingress): {rv_shift:.2f} km/s")
-            
-            combined_error = np.sqrt(fit_begin['center_err']**2 + fit_end['center_err']**2)
-            significance = np.abs(rv_shift) / combined_error
-            print(f"Significance: {significance:.1f}σ")
-            
-            if significance > 2:
-                print(f"✓ Significant shift detected (> 2σ)")
-            else:
-                print(f"✗ No significant shift (< 2σ)")
-        else:
-            print("\nCannot calculate velocity shift without both fits")
-        
-        return {'rv_shift': rv_shift, 'significance': significance}
 
 
 class PlottingUtils:
@@ -842,14 +783,12 @@ class PlottingUtils:
         ax.set_xlabel('Radial Velocity in Planet Rest Frame (km s$^{-1}$)', fontsize=18)
         ax.set_ylabel('Amplitude (ppm)', fontsize=18)
         
-        # Phase legend
         phase_legend = ax.legend(loc='upper right', fontsize=14, frameon=True, fancybox=True, 
                                shadow=True, framealpha=0.9)
         ax.add_artist(phase_legend)
         
         ax.grid(True, alpha=0.3)
         
-        # Add velocity legend
         if fit_begin is not None and fit_end is not None:
             from matplotlib.lines import Line2D
             legend_elements = [
@@ -964,14 +903,12 @@ class Atmosphere:
         print(f"\nProcessing template: {template_name}")
         print(f"Template file: {template_path}")
         
-        # Load template
         model_wave, model_flux = TemplateUtils.load_template(template_path)
         if model_wave is None:
             return None
         
         print(f"Template wavelength range: {model_wave.min():.1f} - {model_wave.max():.1f} Å")
         
-        # Ensure data is loaded and cleaned
         if self.data_table is None:
             self.load_data()
         
@@ -992,12 +929,10 @@ class Atmosphere:
         )
         cc_grid = np.array(cc_grid)
         
-        # Find best parameters
         snr_grid, vsys_grid, kp_grid = DetectionAnalysis.find_best_kp_vsys(
             rv_grid, cc_grid, self.data_table['phases'], self.system, template_name
         )
         
-        # Generate plots
         output_path = Path(output_dir)
         output_path.mkdir(exist_ok=True)
         
@@ -1006,17 +941,14 @@ class Atmosphere:
         PlottingUtils.plot_planet_rest_frame(rv_grid, cc_grid, self.data_table,
                                             self.transit_indices, template_name)
         
-        # Add blueshift analysis
-        blueshift_results = None
         if include_blueshift_analysis:
             try:
-                blueshift_results = DetectionAnalysis.analyze_blueshift_phase_by_phase(
+                DetectionAnalysis.analyze_blueshift_phase_by_phase(
                     rv_grid, cc_grid, self.data_table['phases'], 
                     self.transit_indices, self.system.kp, self.system.vsys, template_name
                 )
-                print(f"Blueshift analysis completed for {template_name}")
             except Exception as e:
-                print(f"Blueshift analysis failed for {template_name}: {e}")
+                pass
         
         results = {
             'template_name': template_name,
@@ -1027,8 +959,7 @@ class Atmosphere:
             'vsys_grid': vsys_grid,
             'kp_grid': kp_grid,
             'max_snr': np.max(snr_grid),
-            'template_wave_range': (model_wave.min(), model_wave.max()),
-            'blueshift_results': blueshift_results
+            'template_wave_range': (model_wave.min(), model_wave.max())
         }
         
         return results
@@ -1044,7 +975,6 @@ class Atmosphere:
         
         print(f"Found {len(template_files)} template files")
         
-        # Ensure data is loaded once
         if self.data_table is None:
             self.load_data()
         
@@ -1056,20 +986,11 @@ class Atmosphere:
         
         print(f"\nProcessed {len(all_results)} templates successfully")
         
-        # Summary report
         print(f"\nSUMMARY:")
-        print(f"{'Species':>12} {'Max SNR':>10} {'RV Shift':>12} {'Significance':>12}")
-        print("-" * 50)
+        print(f"{'Species':>12} {'Max SNR':>10}")
+        print("-" * 25)
         for result in sorted(all_results, key=lambda x: x['max_snr'], reverse=True):
-            if result['blueshift_results'] is not None:
-                rv_shift = result['blueshift_results']['rv_shift']
-                significance = result['blueshift_results']['significance']
-                rv_shift_str = f"{rv_shift:.2f} km/s" if not np.isnan(rv_shift) else "N/A"
-                sig_str = f"{significance:.1f}σ" if not np.isnan(significance) else "N/A"
-            else:
-                rv_shift_str = "N/A"
-                sig_str = "N/A"
-            print(f"{result['species_label']:>12} {result['max_snr']:>10.2f} {rv_shift_str:>12} {sig_str:>12}")
+            print(f"{result['species_label']:>12} {result['max_snr']:>10.2f}")
         
         return all_results
 
@@ -1099,11 +1020,7 @@ if __name__ == "__main__":
                                             include_blueshift_analysis=True)
     
     if single_result:
-        print(f"Successfully processed {single_result['species_label']}")
         print(f"Max SNR: {single_result['max_snr']:.2f}")
-        if single_result['blueshift_results']:
-            rv_shift = single_result['blueshift_results']['rv_shift']
-            significance = single_result['blueshift_results']['significance']
     
     all_results = run_cc.process_all_templates("templates", "results", 
                                                 include_blueshift_analysis=True)
