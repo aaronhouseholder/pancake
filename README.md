@@ -14,6 +14,7 @@ To use the repo:
 
 ```
 git clone https://github.com/aaronhouseholder/pancake/
+cd pancake
 conda create -n pancake python=3.9
 conda activate pancake
 conda install numpy scipy astropy pandas matplotlib tqdm
