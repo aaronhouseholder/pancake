@@ -19,5 +19,6 @@ conda create -n pancake python=3.9
 conda activate pancake
 conda install numpy scipy astropy pandas matplotlib tqdm
 pip install wotan
+pip install lmfit
 pip install jupyter
 ```
